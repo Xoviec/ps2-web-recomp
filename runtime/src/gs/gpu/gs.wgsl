@@ -1102,8 +1102,10 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     scratch[i] = atomicLoad(&vram[i * SCALE * SCALE]);
 }
 
+// raster_direct: each workgroup draws one 16x16 tile, every pixel walking the tile's whole primitive list.
+// Cheapest when tiles hold only a few primitives each (full-screen passes).
 @compute @workgroup_size(16, 16)
-fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn raster_direct(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let index = wid.x + wid.y * 1024u;
     if (index >= prm(3u)) {
         return;
@@ -1140,5 +1142,105 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
             continue;
         }
         shade_at(p, s, x, y, k, px, py);
+    }
+}
+
+// raster: the same, for batches whose tiles hold many primitives. A pixel only depends on the primitives
+// that cover it, in their original order, so the tile's primitive list is walked in chunks: the workgroup stages a chunk's
+// bounding boxes and triangle corners in shared memory, every pixel picks out the primitives that may
+// cover it (bounding box plus a conservative edge test; shade_at repeats the exact one), and then
+// shades only those. Neighbouring pixels no longer wait on each other's primitives.
+const RASTER_CHUNK: u32 = 256u;
+var<workgroup> chunk_p: array<u32, 256>;
+var<workgroup> chunk_box: array<vec2<u32>, 256>;
+var<workgroup> chunk_kind: array<u32, 256>;
+var<workgroup> chunk_a: array<vec4<f32>, 256>;
+var<workgroup> chunk_b: array<vec2<f32>, 256>;
+var<workgroup> tile_count: u32;
+
+fn edge_maybe(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32, sg: f32) -> bool {
+    let l = (ax - px) * (by - py);
+    let r = (bx - px) * (ay - py);
+    return (l - r) * sg >= -(abs(l) + abs(r)) * 1e-5;
+}
+
+@compute @workgroup_size(16, 16)
+fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let index = wid.x + wid.y * 1024u;
+    if (index >= prm(3u)) {
+        return;
+    }
+    let tile = prm(0u) + index * 2u;
+    let origin = data[tile];
+    let sx = (origin & 0xFFFFu) * 16u + lid.x;
+    let sy = (origin >> 16u) * 16u + lid.y;
+    let x = i32(sx / SCALE);
+    let y = i32(sy / SCALE);
+    let k = (sy % SCALE) * SCALE + sx % SCALE;
+    let px = f32(x) + f32(sx % SCALE) / f32(SCALE);
+    let py = f32(y) + f32(sy % SCALE) / f32(SCALE);
+    let first = data[tile + 1u];
+    if (li == 0u) {
+        tile_count = data[tile + 3u] - first;
+    }
+    let count = workgroupUniformLoad(&tile_count);
+    let lists = prm(4u);
+    let prims = prm(1u);
+    let setups = prm(2u);
+    snapshot_lo = prm(5u);
+    snapshot_hi = prm(6u);
+    var last_setup = 0xFFFFFFFFu;
+    var s: Setup;
+    for (var base = 0u; base < count; base = base + RASTER_CHUNK) {
+        if (base + li < count) {
+            let h = first + base + li;
+            let p = prims + ((data[lists + (h >> 1u)] >> ((h & 1u) * 16u)) & 0xFFFFu) * PRIM_WORDS;
+            chunk_p[li] = p;
+            chunk_box[li] = vec2<u32>(data[p + 2u], data[p + 3u]);
+            let kind = data[p + 1u];
+            chunk_kind[li] = kind;
+            if (kind == 0u) {
+                chunk_a[li] = vec4<f32>(fat(p + 4u), fat(p + 5u), fat(p + 6u), fat(p + 7u));
+                chunk_b[li] = vec2<f32>(fat(p + 8u), fat(p + 9u));
+                if (fat(p + 10u) < 0.0) {
+                    chunk_kind[li] = 4u;
+                }
+            }
+        }
+        workgroupBarrier();
+        let n = min(RASTER_CHUNK, count - base);
+        for (var group = 0u; group < n; group = group + 32u) {
+            var mask = 0u;
+            let m = min(32u, n - group);
+            for (var j = 0u; j < m; j = j + 1u) {
+                let c = group + j;
+                let box = chunk_box[c];
+                if (x < i32(box.x & 0xFFFFu) || y < i32(box.x >> 16u) || x > i32(box.y & 0xFFFFu) || y > i32(box.y >> 16u)) {
+                    continue;
+                }
+                let kind = chunk_kind[c];
+                if (kind == 0u || kind == 4u) {
+                    let a = chunk_a[c];
+                    let b = chunk_b[c];
+                    let sg = select(1.0, -1.0, kind == 4u);
+                    if (!edge_maybe(a.z, a.w, b.x, b.y, px, py, sg) || !edge_maybe(b.x, b.y, a.x, a.y, px, py, sg) || !edge_maybe(a.x, a.y, a.z, a.w, px, py, sg)) {
+                        continue;
+                    }
+                }
+                mask = mask | (1u << j);
+            }
+            while (mask != 0u) {
+                let j = firstTrailingBit(mask);
+                mask = mask & (mask - 1u);
+                let p = chunk_p[group + j];
+                let si = data[p];
+                if (si != last_setup) {
+                    s = load_setup(setups + si * SETUP_WORDS);
+                    last_setup = si;
+                }
+                shade_at(p, s, x, y, k, px, py);
+            }
+        }
+        workgroupBarrier();
     }
 }

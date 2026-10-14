@@ -647,6 +647,9 @@ void install_servers() {
         switch (method) {
         case 1: store<std::uint32_t>(g_ram + ret, iop::kernel::alloc(ee_read<std::uint32_t>(args))); break;
         case 2: iop::kernel::free(ee_read<std::uint32_t>(args)); store<std::uint32_t>(g_ram + ret, 0); break;
+        // sceSifAllocSysMemory: size first, then the allocation type and address, which a
+        // first-fit heap can ignore. Answering 0 here sends the game to wipe IOP memory from 0.
+        case 4: store<std::uint32_t>(g_ram + ret, iop::kernel::alloc(ee_read<std::uint32_t>(args))); break;
         case 5: store<std::uint32_t>(g_ram + ret, iop::kRamSize); break;
         case 6: store<std::uint32_t>(g_ram + ret, iop::kernel::free_max()); break;
         case 7: store<std::uint32_t>(g_ram + ret, iop::kernel::free_total()); break;

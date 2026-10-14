@@ -12,8 +12,11 @@ struct Layout {
 
 enum Import : std::uint32_t {
     kClipValue, kClipPost, kSetClip, kStart, kMac, kStatus, kClip, kForceMac, kMul, kMsub, kToFixed, kFromFixed,
-    kDiv, kSqrt, kRsqrt, kEfu, kKick, kTop, kItop, kRandNext, kInterpret, kImports
+    kDiv, kSqrt, kRsqrt, kEfu, kKick, kTop, kItop, kRandNext, kInterpret, kPipe, kImports
 };
+
+// Operations of the kPipe import on the pending FDIV/EFU results (FlagPipe).
+enum PipeOp : std::uint32_t { kSyncQ, kSyncP, kWaitQ, kWaitP, kFinish };
 
 extern const char *const kImportNames[kImports];
 

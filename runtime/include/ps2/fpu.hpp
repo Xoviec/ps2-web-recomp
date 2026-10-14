@@ -68,6 +68,19 @@ inline std::uint32_t mul(std::uint32_t a, std::uint32_t b) {
     return pack(sign, e, static_cast<std::uint32_t>(m));
 }
 
+// MADD/MSUB(A): when the product overflows the result is the saturated product, whatever
+// the accumulator holds (ps2autotests cpu/ee_fpu/muldiv: madd(-MAX, MAX, MAX) = +MAX).
+inline std::uint32_t madd(std::uint32_t acc, std::uint32_t a, std::uint32_t b, bool negate) {
+    std::uint32_t p = mul(a, b);
+    if (negate) p ^= kSign;
+    if (exponent(a) && exponent(b)) {
+        const std::uint64_t m = static_cast<std::uint64_t>(mantissa(a)) * mantissa(b);
+        const int e = static_cast<int>(exponent(a) + exponent(b)) - 127 + static_cast<int>(m >> 47);
+        if (e > 255) return p;
+    }
+    return add(acc, p);
+}
+
 inline double to_double(std::uint32_t x) {
     if (!exponent(x)) return (x & kSign) ? -0.0 : 0.0;
     const std::uint64_t bits = (static_cast<std::uint64_t>(x & kSign) << 32) |
@@ -84,6 +97,25 @@ inline std::uint32_t from_double(double d) {
     return pack(sign, e - 1023 + 127, static_cast<std::uint32_t>(bits >> 29));
 }
 
+// DIV, SQRT and RSQRT round to nearest on the R5900 (ps2autotests cpu/ee_fpu/sqrt,
+// muldiv): sqrt(0x3FFFFFFF) = 0x3FB504F3, 1/0x3FFFFFFF = 0x3F000001, rsqrt(1,25) = 0x3E4CCCCD.
+inline std::uint32_t from_double_rn(double d) {
+    const std::uint64_t bits = std::bit_cast<std::uint64_t>(d);
+    const std::uint32_t sign = static_cast<std::uint32_t>(bits >> 32) & kSign;
+    int e = static_cast<int>((bits >> 52) & 0x7FFu);
+    if (!e) return sign;
+    std::uint64_t m = (bits & 0xFFFFFFFFFFFFFull) | (1ull << 52);
+    const std::uint64_t rest = m & 0x1FFFFFFFull, half = 1ull << 28;
+    m >>= 29;
+    if (rest > half || (rest == half && (m & 1))) {
+        if (++m >> 24) {
+            m >>= 1;
+            ++e;
+        }
+    }
+    return pack(sign, e - 1023 + 127, static_cast<std::uint32_t>(m));
+}
+
 struct Result {
     std::uint32_t value;
     bool invalid;
@@ -95,13 +127,13 @@ inline Result div(std::uint32_t a, std::uint32_t b) {
     const std::uint32_t sign = (a ^ b) & kSign;
     if (!(b & kAbs)) return {sign | kAbs, true};
     if (!(a & kAbs)) return {sign, false};
-    return {from_double(to_double(a) / to_double(b)), false};
+    return {from_double_rn(to_double(a) / to_double(b)), false};
 }
 
 inline std::uint32_t sqrt(std::uint32_t a) {
     a = flush(a) & kAbs;
     if (!a) return 0;
-    return from_double(std::sqrt(to_double(a)));
+    return from_double_rn(std::sqrt(to_double(a)));
 }
 
 inline Result rsqrt(std::uint32_t a, std::uint32_t b) {
@@ -109,7 +141,8 @@ inline Result rsqrt(std::uint32_t a, std::uint32_t b) {
     b = flush(b) & kAbs;
     if (!b) return {(a & kSign) | kAbs, true};
     if (!(a & kAbs)) return {a & kSign, false};
-    return {from_double(to_double(a) / std::sqrt(to_double(b))), false};
+    // RSQRT: the square root rounds to nearest, the division truncates.
+    return {from_double(to_double(a) / to_double(from_double_rn(std::sqrt(to_double(b))))), false};
 }
 
 inline std::int32_t key(std::uint32_t x) {
@@ -118,8 +151,14 @@ inline std::int32_t key(std::uint32_t x) {
     return (x & kSign) ? -magnitude : magnitude;
 }
 
-inline std::uint32_t max(std::uint32_t a, std::uint32_t b) { return key(a) >= key(b) ? a : b; }
-inline std::uint32_t min(std::uint32_t a, std::uint32_t b) { return key(a) <= key(b) ? a : b; }
+// MAX/MIN order raw sign-magnitude bits without flushing (-0 < +0, denormals kept):
+// games load integer constants with MAXi/MINIi.
+inline std::int32_t raw_key(std::uint32_t x) {
+    const auto s = static_cast<std::int32_t>(x);
+    return s < 0 ? s ^ static_cast<std::int32_t>(kAbs) : s;
+}
+inline std::uint32_t max(std::uint32_t a, std::uint32_t b) { return raw_key(a) >= raw_key(b) ? a : b; }
+inline std::uint32_t min(std::uint32_t a, std::uint32_t b) { return raw_key(a) <= raw_key(b) ? a : b; }
 
 inline std::uint32_t to_fixed(std::uint32_t x, int fraction) {
     const int e = static_cast<int>(exponent(x)) + fraction;

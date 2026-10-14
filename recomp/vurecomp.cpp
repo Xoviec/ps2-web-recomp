@@ -147,6 +147,8 @@ Upper upper(std::uint32_t hi, bool flags_live) {
     unsigned d = dest;
     if (kind == Opmula || kind == Opmsub) d = 0xE;
     if (d == 0 || (target == 0 && !(flags && flags_live))) return u;
+    // Q lands lazily: only its readers check whether the pending FDIV result is due.
+    if (src == Q) u.pre = "fl.sync_q(r); ";
     const auto b = [&](int i) -> std::string {
         switch (src) {
         case Vec: return vf(ft, i);
@@ -341,10 +343,10 @@ Lower lower(std::uint32_t w, std::uint32_t pc) {
             c = std::format("{{ set_vi(r, {}, r.vi[{}] - 1u); std::uint8_t *q = qword(mem, r.vi[{}]); ", it, it, it) +
                 lanes_store(dest, "q", std::format("r.vf[{}]", fs)) + "} ";
             break;
-        case 0x38: c = std::format("vu::div(r, r.vf[{}].w[{}], r.vf[{}].w[{}]); ", fs, fsf, ft, ftf); break;
-        case 0x39: c = std::format("vu::sqrt(r, r.vf[{}].w[{}]); ", ft, ftf); break;
-        case 0x3A: c = std::format("vu::rsqrt(r, r.vf[{}].w[{}], r.vf[{}].w[{}]); ", fs, fsf, ft, ftf); break;
-        case 0x3B: break;
+        case 0x38: c = std::format("qdiv(r, fl, r.vf[{}].w[{}], r.vf[{}].w[{}]); ", fs, fsf, ft, ftf); break;
+        case 0x39: c = std::format("qsqrt(r, fl, r.vf[{}].w[{}]); ", ft, ftf); break;
+        case 0x3A: c = std::format("qrsqrt(r, fl, r.vf[{}].w[{}], r.vf[{}].w[{}]); ", fs, fsf, ft, ftf); break;
+        case 0x3B: c = "fl.wait_q(r); "; break;
         case 0x3C: c = std::format("set_vi(r, {}, r.vf[{}].w[{}]); ", it, fs, fsf); break;
         case 0x3D:
             if (ft) l.writes = static_cast<int>(ft);
@@ -379,14 +381,16 @@ Lower lower(std::uint32_t w, std::uint32_t pc) {
         case 0x43: c = std::format("r.r = (r.r ^ r.vf[{}].w[{}]) & 0x7FFFFFu; ", fs, fsf); break;
         case 0x64:
             if (ft) l.writes = static_cast<int>(ft);
-            if (ft) for (int i = 0; i < 4; ++i) if (lane(dest, i)) c += std::format("r.vf[{}].w[{}] = r.p; ", ft, i); break;
+            if (ft) c = "fl.sync_p(r); ";
+            if (ft) for (int i = 0; i < 4; ++i) if (lane(dest, i)) c += std::format("r.vf[{}].w[{}] = r.p; ", ft, i);
+            break;
         case 0x68: c = std::format("set_vi(r, {}, vu::top()); ", it); break;
         case 0x69: c = std::format("set_vi(r, {}, vu::itop()); ", it); break;
         case 0x6C: c = std::format("vu::kick(1, r.vi[{}]); ", is); break;
         case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x78: case 0x79: case 0x7A: case 0x7C: case 0x7D: case 0x7E:
-            c = std::format("efu(r, {}u, {}u, {}u); ", index, fs, fsf);
+            c = std::format("efu(r, fl, {}u, {}u, {}u); ", index, fs, fsf);
             break;
-        case 0x7B: break;
+        case 0x7B: c = "fl.wait_p(r); "; break;
         default: l.supported = false; break;
         }
         return l;
@@ -425,10 +429,10 @@ Lower lower(std::uint32_t w, std::uint32_t pc) {
     case 0x14: c = std::format("set_vi(r, {}, (fl.status() & 0xFFFu) == {}u ? 1u : 0u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
     case 0x15: c = std::format("r.status = (fl.status() & 0x3Fu) | ({}u & 0xFC0u); fl.force_mac(r.mac, r.status); ", imm12); l.reads_flags = l.reads_status = true; break;
     case 0x16: c = std::format("set_vi(r, {}, fl.status() & {}u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
-    case 0x17: c = std::format("set_vi(r, {}, ((fl.status() | {}u) & 0xFFFu) == 0xFFFu ? 1u : 0u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
+    case 0x17: c = std::format("set_vi(r, {}, (fl.status() | {}u) & 0xFFFu); ", it, imm12); l.reads_flags = l.reads_status = true; break;
     case 0x18: c = std::format("set_vi(r, {}, (fl.mac() & 0xFFFFu) == r.vi[{}] ? 1u : 0u); ", it, is); l.reads_flags = true; break;
     case 0x1A: c = std::format("set_vi(r, {}, fl.mac() & r.vi[{}]); ", it, is); l.reads_flags = true; break;
-    case 0x1B: c = std::format("set_vi(r, {}, ((fl.mac() | r.vi[{}]) & 0xFFFFu) == 0xFFFFu ? 1u : 0u); ", it, is); l.reads_flags = true; break;
+    case 0x1B: c = std::format("set_vi(r, {}, (fl.mac() | r.vi[{}]) & 0xFFFFu); ", it, is); l.reads_flags = true; break;
     case 0x1C: c = std::format("set_vi(r, {}, fl.clip() & 0xFFFu); ", it); break;
     case 0x20: c = "pend = true; "; l.branch = true; l.target = target; break;
     case 0x21: c = std::format("set_vi(r, {}, {}u); pend = true; ", it, (pc + 16u) / 8u); l.branch = true; l.target = target; break;
@@ -536,7 +540,7 @@ std::string generate(const Program &p, std::string &name) {
         o += std::format("{}: {{ ++fl.t; ", label(pc));
         o += u.pre;
         if (hi & 0x80000000u) o += std::format("r.i = {}u; ", lo);
-        else if (!l.supported) o += std::format("vu::interpret(1, {}u); return; ", pc);
+        else if (!l.supported) o += std::format("--fl.t; fl.park(r); vu::interpret(1, {}u); return; ", pc);
         else o += l.code;
         o += u.post;
         const int lower_write = (hi & 0x80000000u) || !l.supported ? -1 : l.writes;
@@ -552,14 +556,14 @@ std::string generate(const Program &p, std::string &name) {
         if (in.count(prev)) {
             const Lower &pl = lowers[prev];
             const std::uint32_t phi = word(p.code, prev + 4);
-            if (phi & 0x40000000u) o += std::format("    if (ending) {{ r.tpc = {}u; return; }}\n", (pc + 8u) & kMask);
+            if (phi & 0x40000000u) o += std::format("    if (ending) {{ fl.finish(r); r.tpc = {}u; return; }}\n", (pc + 8u) & kMask);
             if (pl.branch) o += std::format("    if (pend) {{ pend = false; goto {}; }}\n", label(pl.target));
             if (pl.jump) o += "    if (pendj) { pendj = false; goto dispatch; }\n";
         }
         const std::uint32_t next = (pc + 8u) & kMask;
-        if (!in.count(next)) o += std::format("    vu::interpret(1, {}u);\n    return;\n", next);
+        if (!in.count(next)) o += std::format("    fl.park(r);\n    vu::interpret(1, {}u);\n    return;\n", next);
     }
-    o += "dispatch:\n    vu::interpret(1, jpc);\n    return;\n}\n\n";
+    o += "dispatch:\n    fl.park(r);\n    vu::interpret(1, jpc);\n    return;\n}\n\n";
     return local_vi(o);
 }
 

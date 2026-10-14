@@ -107,10 +107,18 @@ void finish(int ch) {
     if (trace && ch <= 4) std::fprintf(stderr, "[dma] ch%d done chcr 0x%08X tadr 0x%08X madr 0x%08X\n", ch, c.chcr, c.tadr, c.madr);
     c.chcr &= ~0x100u;
     hw::dmac_raise(static_cast<unsigned>(ch));
+    if (ch == 1) gif::vif1_idle();
     if (ch == 8 && g_mfifo_waiting && (g_ch[1].chcr & 0x100u) && !g_ch[1].paused) {
         g_mfifo_waiting = false;
         run_chain(1);
     }
+}
+
+// Channel 2 stays busy until the GIF has sent on everything it took, which a masked PATH3
+// holds back; gif resumes it once its FIFO empties.
+void complete(int ch) {
+    if (ch == 2 && gif::path3_held()) pause(2, true);
+    else finish(ch);
 }
 
 void spr_to_ram(Channel &c, std::uint32_t qwc) {
@@ -174,7 +182,7 @@ void run_normal(int ch) {
         pause(ch, true);
         return;
     }
-    finish(ch);
+    complete(ch);
 }
 
 bool chain_ends_after_current(const Channel &c) {
@@ -200,7 +208,7 @@ void run_chain(int ch) {
             return;
         }
         if (end) {
-            finish(ch);
+            complete(ch);
             return;
         }
     }
@@ -277,7 +285,7 @@ void run_chain(int ch) {
         if (end || (tie && irq)) break;
     }
     c.qwc = 0;
-    finish(ch);
+    complete(ch);
 }
 
 void start(int ch) {

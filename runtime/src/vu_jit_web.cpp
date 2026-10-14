@@ -1,6 +1,7 @@
 #include "vu_jit_web.hpp"
 
 #include "vu_jit.hpp"
+#include "vu_micro.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -101,10 +102,20 @@ EMSCRIPTEN_KEEPALIVE std::uint32_t ps2jit_mul(std::uint32_t a, std::uint32_t b) 
 EMSCRIPTEN_KEEPALIVE std::uint32_t ps2jit_msub(std::uint32_t acc, std::uint32_t a, std::uint32_t b) { return vuops::msub(acc, a, b); }
 EMSCRIPTEN_KEEPALIVE std::uint32_t ps2jit_to_fixed(std::uint32_t x, int frac) { return fp::to_fixed(x, frac); }
 EMSCRIPTEN_KEEPALIVE std::uint32_t ps2jit_from_fixed(std::int32_t x, int frac) { return fp::from_fixed(x, frac); }
-EMSCRIPTEN_KEEPALIVE void ps2jit_div(Vu0Regs *r, std::uint32_t s, std::uint32_t t) { vu::div(*r, s, t); }
-EMSCRIPTEN_KEEPALIVE void ps2jit_sqrt(Vu0Regs *r, std::uint32_t t) { vu::sqrt(*r, t); }
-EMSCRIPTEN_KEEPALIVE void ps2jit_rsqrt(Vu0Regs *r, std::uint32_t s, std::uint32_t t) { vu::rsqrt(*r, s, t); }
-EMSCRIPTEN_KEEPALIVE void ps2jit_efu(Vu0Regs *r, unsigned index, unsigned fs, unsigned fsf) { vuops::efu(*r, index, fs, fsf); }
+EMSCRIPTEN_KEEPALIVE void ps2jit_div(Vu0Regs *r, std::uint32_t s, std::uint32_t t) { vuops::qdiv(*r, vu::jit::g_state.fl, s, t); }
+EMSCRIPTEN_KEEPALIVE void ps2jit_sqrt(Vu0Regs *r, std::uint32_t t) { vuops::qsqrt(*r, vu::jit::g_state.fl, t); }
+EMSCRIPTEN_KEEPALIVE void ps2jit_rsqrt(Vu0Regs *r, std::uint32_t s, std::uint32_t t) { vuops::qrsqrt(*r, vu::jit::g_state.fl, s, t); }
+EMSCRIPTEN_KEEPALIVE void ps2jit_efu(Vu0Regs *r, unsigned index, unsigned fs, unsigned fsf) { vuops::efu(*r, vu::jit::g_state.fl, index, fs, fsf); }
+EMSCRIPTEN_KEEPALIVE void ps2jit_pipe(Vu0Regs *r, std::uint32_t op) {
+    vuops::FlagPipe &fl = vu::jit::g_state.fl;
+    switch (op) {
+    case vu::jit::kSyncQ: fl.sync_q(*r); break;
+    case vu::jit::kSyncP: fl.sync_p(*r); break;
+    case vu::jit::kWaitQ: fl.wait_q(*r); break;
+    case vu::jit::kWaitP: fl.wait_p(*r); break;
+    default: fl.finish(*r); break;
+    }
+}
 EMSCRIPTEN_KEEPALIVE void ps2jit_kick(std::uint32_t address) {
     if (vu::jit::g_dry) {
         vu::jit::g_kicks->push_back(address);
@@ -116,6 +127,7 @@ EMSCRIPTEN_KEEPALIVE std::uint32_t ps2jit_top() { return vu::top(); }
 EMSCRIPTEN_KEEPALIVE std::uint32_t ps2jit_itop() { return vu::itop(); }
 EMSCRIPTEN_KEEPALIVE std::uint32_t ps2jit_rand_next(std::uint32_t x) { return vu::rand_next(x); }
 EMSCRIPTEN_KEEPALIVE void ps2jit_interpret(std::uint32_t pc) {
+    vu::jit::g_state.fl.park(vu::regs(1));
     if (vu::jit::g_dry) {
         vu::jit::g_escape = pc;
         return;

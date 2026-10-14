@@ -1,5 +1,6 @@
 #include "gif.hpp"
 
+#include "../dmac.hpp"
 #include "gs.hpp"
 #include "queue.hpp"
 
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace ps2::gif {
 
@@ -144,12 +146,98 @@ void scan(Path &p, const std::uint8_t *data, std::uint32_t qwc) {
 
 Path g_scan[4];
 
+// PATH3 data the GIF holds while VIF1's MSKPATH3 masks the path. The mask only stops PATH3
+// between packets, once an EOP tag's data is through: games chain a group of uploads into
+// one packet and let exactly one group in per unmask.
+struct Fifo {
+    std::vector<std::uint8_t> data;
+    std::size_t head = 0;
+    std::uint32_t left = 0; // data qwords still due under the current tag
+    bool between = true, last = false, masked = false;
+    std::uint32_t queued() const { return static_cast<std::uint32_t>((data.size() - head) / 16); }
+};
+
+// With the VU thread up each side keeps one, fed in the same order: the EE's follows its
+// shadow VIF1 for channel 2's completion and GIF_STAT, the VU thread's holds the data for
+// the GS so it lands between the right PATH1/PATH2 draws.
+Fifo g_fifo[2];
+
+bool on_vu_thread() { return gs::queue::role() == gs::queue::Role::Vu; }
+Fifo &fifo() { return g_fifo[on_vu_thread() ? 1 : 0]; }
+
+void send(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    if (!qwc) return;
+    if (!gs::queue::active()) {
+        render(path, data, qwc);
+        return;
+    }
+    if (!on_vu_thread()) scan(g_scan[path], data, qwc);
+    // the VU thread's copy of PATH3 goes to the GS
+    if (path == 3 && gs::queue::vu_active() && !on_vu_thread()) return;
+    gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
+}
+
+// Qwords of `data` PATH3 sends before it can next stop: through the end of the current
+// packet, or all of it.
+std::uint32_t advance(Fifo &f, const std::uint8_t *data, std::uint32_t qwc, bool all) {
+    std::uint32_t i = 0;
+    while (i < qwc) {
+        if (!f.left) {
+            std::uint64_t tag;
+            std::memcpy(&tag, data + static_cast<std::size_t>(i) * 16, 8);
+            const std::uint32_t nloop = static_cast<std::uint32_t>(tag) & 0x7FFFu, flg = static_cast<std::uint32_t>(tag >> 58) & 3u;
+            const std::uint32_t nreg = (static_cast<std::uint32_t>(tag >> 60) & 0xFu) ? static_cast<std::uint32_t>(tag >> 60) & 0xFu : 16u;
+            f.left = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+            f.last = (tag >> 15) & 1u;
+            ++i;
+        } else {
+            const std::uint32_t take = std::min(f.left, qwc - i);
+            f.left -= take;
+            i += take;
+        }
+        f.between = !f.left && f.last;
+        if (f.between && !all) break;
+    }
+    return i;
+}
+
+void release(Fifo &f, bool all) {
+    const std::uint32_t n = advance(f, f.data.data() + f.head, f.queued(), all);
+    if (!n) return;
+    send(3, f.data.data() + f.head, n);
+    f.head += static_cast<std::size_t>(n) * 16;
+    if (f.head < f.data.size()) return;
+    f.data.clear();
+    f.head = 0;
+    if (!on_vu_thread()) dmac::resume(2);
+}
+
+void push(const std::uint8_t *data, std::uint32_t qwc) {
+    Fifo &f = fifo();
+    if (!f.queued()) {
+        const std::uint32_t n = f.masked && f.between ? 0 : advance(f, data, qwc, !f.masked);
+        send(3, data, n);
+        data += static_cast<std::size_t>(n) * 16;
+        qwc -= n;
+    }
+    f.data.insert(f.data.end(), data, data + static_cast<std::size_t>(qwc) * 16);
+    // data already waiting while unmasked: the unmask that let one packet through was a while ago
+    if (!f.masked) release(f, true);
+}
+
 }
 
 void reset() {
-    g_stat = 0;
+    Fifo &f = fifo();
+    const bool held = f.queued() != 0;
+    f = Fifo{};
+    if (!on_vu_thread()) {
+        g_stat = 0;
+        if (held) dmac::resume(2);
+    }
     if (gs::queue::active()) {
-        for (Path &p : g_scan) p = Path{};
+        if (!on_vu_thread())
+            for (Path &p : g_scan) p = Path{};
         gs::queue::post(gs::queue::kGifReset, 0, 0, nullptr, 0);
         return;
     }
@@ -166,12 +254,12 @@ void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
 }
 
 void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
-    if (!gs::queue::active()) {
-        render(path, data, qwc);
+    if (path != 3) {
+        send(path, data, qwc);
         return;
     }
-    if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
-    gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
+    if (gs::queue::vu_active() && !on_vu_thread()) gs::queue::vu().post(gs::queue::kGif, 3, qwc, data, qwc * 16);
+    push(data, qwc);
 }
 
 void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc) { scan(g_scan[path], data, qwc); }
@@ -186,13 +274,35 @@ void stats() {
 }
 
 std::uint32_t read(std::uint32_t a) {
-    if ((a & 0xF0u) == 0x20u) return g_stat;
+    // M3P, and FQC counting what a masked PATH3 has left waiting in the FIFO
+    const Fifo &f = g_fifo[0];
+    if ((a & 0xF0u) == 0x20u) return (g_stat & ~2u) | (f.masked ? 2u : 0u) | (std::min(f.queued(), 16u) << 24);
     return 0;
 }
 
 void write(std::uint32_t a, std::uint32_t v) {
     if ((a & 0xF0u) == 0x00u && (v & 1u)) reset();
+    if ((a & 0xF0u) == 0x10u) g_stat = (g_stat & ~1u) | (v & 1u);
 }
+
+void set_path3_masked(bool masked) {
+    Fifo &f = fifo();
+    f.masked = masked;
+    // the GIF arbitrates as soon as the mask drops, so a packet goes out before VIF1 can mask again
+    if (!masked) release(f, false);
+}
+
+void path3_flush() {
+    Fifo &f = fifo();
+    if (!f.masked) release(f, true);
+}
+
+void vif1_idle() {
+    if (gs::queue::vu_active() && !on_vu_thread()) gs::queue::vu().post(gs::queue::kPath3Flush, 0, 0, nullptr, 0);
+    path3_flush();
+}
+
+bool path3_held() { return g_fifo[0].queued() != 0; }
 
 }
 
@@ -204,6 +314,16 @@ void state(ps2::state::Stream &s) {
     s.pod(g_stat);
     s.pod(g_tags);
     s.pod(g_scan);
+    Fifo &f = g_fifo[0];
+    f.data.erase(f.data.begin(), f.data.begin() + static_cast<std::ptrdiff_t>(f.head));
+    f.head = 0;
+    s.vec(f.data);
+    s.pod(f.left);
+    s.pod(f.between);
+    s.pod(f.last);
+    s.pod(f.masked);
+    // the VU thread has caught up (sync_vu_thread), so its copy matches the EE's
+    if (s.loading()) g_fifo[1] = f;
 }
 
 }

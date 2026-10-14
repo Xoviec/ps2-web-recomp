@@ -1,0 +1,7 @@
+# Frame-hash regression cases for Burnout 3 (scripts/regress.sh, README "Regression tests").
+# States live in games/burnout3/states/ (ignored with all of games/) or $REGRESS_STATES/burnout3/.
+# name     state               frames  runner args             hashes: <renderer>-<os>-<arch>=md5
+boot       -                   1900                            gpu-darwin-arm64=75b8bcd9e604c1172a4a3ed1024858d4 soft-darwin-arm64=78ddaaf4f6b208356de5cc6ba6456534
+menu       menu3150.v4.state   300                             gpu-darwin-arm64=0e3f0d25b9fb8256c5c02505ba8a3951 soft-darwin-arm64=8c4358d7852470aa94ce435654489d8f
+carselect  carselect.v4.state  200                             gpu-darwin-arm64=7640ba61f50a7c4995fe4d2e2a5d868e soft-darwin-arm64=1a1dde34f310afe47c3c3fda187ea842
+race       race.v4.state       300     --press +0:cross:300    gpu-darwin-arm64=fb121c34ac3718cdda14c8e9a98aafe3 soft-darwin-arm64=73f289ce3e168d00a7e6968c3d0d3640

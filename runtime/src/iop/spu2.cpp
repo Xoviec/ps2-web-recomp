@@ -24,6 +24,8 @@ constexpr unsigned kBatch = 32;
 constexpr unsigned kInputFrames = 512;
 constexpr std::uint32_t kInputBase[2] = {0x2000u, 0x2400u};
 constexpr unsigned kSpuLine = 9;
+constexpr std::uint32_t kRingWords = 0x200;
+static_assert(kRingWords % kBatch == 0, "a batch must not straddle the ring end");
 
 enum Phase { kOff, kAttack, kDecay, kSustain, kRelease };
 
@@ -86,6 +88,7 @@ bool g_record = false;
 std::function<void(const std::int16_t *, std::size_t)> g_sink;
 std::uint64_t g_next_tick = 0;
 bool g_tick_pending = false;
+std::uint32_t g_ring_pos = 0;
 
 void check_irq(std::uint32_t address, std::uint32_t words) {
     for (Core &k : g_cores) {
@@ -170,7 +173,9 @@ std::int32_t volume(std::uint16_t reg, Envelope &e) {
     return e.level;
 }
 
-void render_voice(Voice &v, std::int32_t (*sum)[2]) {
+std::int16_t clamp16(std::int32_t v) { return static_cast<std::int16_t>(std::clamp(v, -32768, 32767)); }
+
+void render_voice(Voice &v, std::int32_t (*sum)[2], std::int16_t *raw) {
     if (v.key_on) key_on(v);
     const std::uint32_t step = std::min<std::uint32_t>(v.pitch, 0x3FFFu);
     const bool sweep_l = v.voll & 0x8000u, sweep_r = v.volr & 0x8000u;
@@ -193,6 +198,7 @@ void render_voice(Voice &v, std::int32_t (*sum)[2]) {
         }
         update_envelope(v);
         const std::int32_t out = sample * v.env.level >> 15;
+        if (raw) raw[n] = clamp16(out);
         sum[n][0] += out * (sweep_l ? volume(v.voll, v.vol[0]) : fixed_l) >> 15;
         sum[n][1] += out * (sweep_r ? volume(v.volr, v.vol[1]) : fixed_r) >> 15;
     }
@@ -227,11 +233,13 @@ void feed_input(int core) {
     }
 }
 
-void render_input(int core, std::int32_t &left, std::int32_t &right) {
+void render_input(int core, std::int32_t &left, std::int32_t &right, std::int16_t &raw_l, std::int16_t &raw_r) {
     Core &k = g_cores[core];
     if (!k.input_count) return;
     const unsigned slot = k.input_read;
     check_irq(kInputBase[core] + slot, 1);
+    raw_l = k.input[slot][0];
+    raw_r = k.input[slot][1];
     left += k.input[slot][0] * static_cast<std::int16_t>(k.bvol[0]) >> 15;
     right += k.input[slot][1] * static_cast<std::int16_t>(k.bvol[1]) >> 15;
     k.input_read = (k.input_read + 1) % kInputFrames;
@@ -240,31 +248,59 @@ void render_input(int core, std::int32_t &left, std::int32_t &right) {
 
 std::int32_t master(std::uint16_t reg) { return reg & 0x8000u ? 0x7FFF : static_cast<std::int16_t>(reg << 1); }
 
+// Each core streams every sample into fixed rings in SPU RAM, per core c at c*0x800: input L/R (core 1's input is core 0's
+// output), voice 1, voice 3; at 0x1000+c*0x800: dry L/R, wet L/R. Those writes trip IRQA, and some games (Burnout 3:
+// IRQA 0x400) use that as their audio clock. One range check per ring per batch keeps it cheap.
+void write_rings(int core, const std::int16_t (*rings)[kBatch]) {
+    for (std::uint32_t r = 0; r < 8; ++r) {
+        const std::uint32_t at = (r < 4 ? 0u : 0x1000u) + core * 0x800u + (r & 3u) * kRingWords + g_ring_pos;
+        for (unsigned n = 0; n < kBatch; ++n) g_ram[at + n] = static_cast<std::uint16_t>(rings[r][n]);
+        check_irq(at, kBatch);
+    }
+}
+
 void tick() {
     std::int16_t out[kBatch * 2];
     std::int32_t sum[2][kBatch][2] = {};
+    std::int16_t rings[2][8][kBatch] = {};
     static const bool count = std::getenv("PS2_SPU2_COUNT") != nullptr;
     static std::uint64_t ticks = 0, active = 0, phases[5] = {};
     for (int c = 0; c < 2; ++c) {
-        for (Voice &v : g_cores[c].voices) {
+        for (int i = 0; i < 24; ++i) {
+            Voice &v = g_cores[c].voices[i];
             if (!v.key_on && v.phase == kOff) continue;
             if (count) {
                 ++active;
                 ++phases[v.phase];
             }
-            render_voice(v, sum[c]);
+            render_voice(v, sum[c], i == 1 ? rings[c][2] : i == 3 ? rings[c][3] : nullptr);
         }
-        for (unsigned n = 0; n < kBatch; ++n) render_input(c, sum[c][n][0], sum[c][n][1]);
+        // Reverb is not modelled, so the wet rings stay silent.
+        for (unsigned n = 0; n < kBatch; ++n) {
+            rings[c][4][n] = clamp16(sum[c][n][0]);
+            rings[c][5][n] = clamp16(sum[c][n][1]);
+        }
+        std::int16_t unused[2];
+        for (unsigned n = 0; n < kBatch; ++n)
+            render_input(c, sum[c][n][0], sum[c][n][1], c ? unused[0] : rings[0][0][n], c ? unused[1] : rings[0][1][n]);
     }
     for (unsigned n = 0; n < kBatch; ++n) {
         std::int32_t mix[2] = {};
         for (int c = 0; c < 2; ++c) {
-            mix[0] += sum[c][n][0] * master(g_cores[c].mvol[0]) >> 15;
-            mix[1] += sum[c][n][1] * master(g_cores[c].mvol[1]) >> 15;
+            const std::int32_t l = sum[c][n][0] * master(g_cores[c].mvol[0]) >> 15, r = sum[c][n][1] * master(g_cores[c].mvol[1]) >> 15;
+            if (!c) {
+                rings[1][0][n] = clamp16(l);
+                rings[1][1][n] = clamp16(r);
+            }
+            mix[0] += l;
+            mix[1] += r;
         }
-        out[n * 2] = static_cast<std::int16_t>(std::clamp(mix[0], -32768, 32767));
-        out[n * 2 + 1] = static_cast<std::int16_t>(std::clamp(mix[1], -32768, 32767));
+        out[n * 2] = clamp16(mix[0]);
+        out[n * 2 + 1] = clamp16(mix[1]);
     }
+    write_rings(0, rings[0]);
+    write_rings(1, rings[1]);
+    g_ring_pos = (g_ring_pos + kBatch) % kRingWords;
     if (count && ++ticks % 15000 == 0)
         std::fprintf(stderr, "[spu2] %.1f voices per batch (attack %.1f decay %.1f sustain %.1f release %.1f)\n", static_cast<double>(active) / ticks,
                      static_cast<double>(phases[1]) / ticks, static_cast<double>(phases[2]) / ticks, static_cast<double>(phases[3]) / ticks, static_cast<double>(phases[4]) / ticks);
@@ -463,6 +499,7 @@ void reset() {
     g_record = std::getenv("PS2_DUMP_AUDIO") != nullptr;
     g_next_tick = 0;
     g_tick_pending = false;
+    g_ring_pos = 0;
 }
 
 std::uint16_t *ram() { return g_ram.data(); }
@@ -574,6 +611,7 @@ void state(ps2::state::Stream &s) {
     s.pod(g_spdif_media);
     s.pod(g_next_tick);
     s.pod(g_tick_pending);
+    s.pod(g_ring_pos);
 }
 
 }

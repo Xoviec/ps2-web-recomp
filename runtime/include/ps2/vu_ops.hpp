@@ -113,11 +113,24 @@ PS2_VU_INLINE std::uint32_t fout(float f) {
 }
 
 PS2_VU_INLINE float norm(float f) { return fin(fout(f)); }
-PS2_VU_INLINE std::uint32_t add(std::uint32_t a, std::uint32_t b) { return fout(fin(a) + fin(b)); }
-PS2_VU_INLINE std::uint32_t sub(std::uint32_t a, std::uint32_t b) { return fout(fin(a) - fin(b)); }
+// The VU adder rounds toward zero. Microcode relies on it: x + 2^23 - 2^23 is floor(x), not
+// round(x) (Burnout 3's particle sine range reduction). Round to nearest, then step one ulp
+// back toward zero when the exact error (TwoSum) shows the sum was rounded away from zero.
+PS2_VU_INLINE float chop_add(float a, float b) {
+    const float s = a + b, bv = s - a, e = (a - (s - bv)) + (b - bv);
+    std::uint32_t si, ei;
+    std::memcpy(&si, &s, 4);
+    std::memcpy(&ei, &e, 4);
+    if (e != 0.0f && ((si ^ ei) & 0x80000000u)) --si;
+    float r;
+    std::memcpy(&r, &si, 4);
+    return r;
+}
+PS2_VU_INLINE std::uint32_t add(std::uint32_t a, std::uint32_t b) { return fout(chop_add(fin(a), fin(b))); }
+PS2_VU_INLINE std::uint32_t sub(std::uint32_t a, std::uint32_t b) { return fout(chop_add(fin(a), -fin(b))); }
 PS2_VU_INLINE std::uint32_t mul(std::uint32_t a, std::uint32_t b) { return fout(fin(a) * fin(b)); }
-PS2_VU_INLINE std::uint32_t madd(std::uint32_t acc, std::uint32_t a, std::uint32_t b) { return fout(fin(acc) + norm(fin(a) * fin(b))); }
-PS2_VU_INLINE std::uint32_t msub(std::uint32_t acc, std::uint32_t a, std::uint32_t b) { return fout(fin(acc) - norm(fin(a) * fin(b))); }
+PS2_VU_INLINE std::uint32_t madd(std::uint32_t acc, std::uint32_t a, std::uint32_t b) { return fout(chop_add(fin(acc), norm(fin(a) * fin(b)))); }
+PS2_VU_INLINE std::uint32_t msub(std::uint32_t acc, std::uint32_t a, std::uint32_t b) { return fout(chop_add(fin(acc), -norm(fin(a) * fin(b)))); }
 PS2_VU_INLINE std::uint32_t max(std::uint32_t a, std::uint32_t b) { return fp::max(a, b); }
 PS2_VU_INLINE std::uint32_t min(std::uint32_t a, std::uint32_t b) { return fp::min(a, b); }
 
@@ -141,23 +154,27 @@ PS2_VU_INLINE v4u vfix(v4u x) {
 PS2_VU_INLINE v4f vin(v4u x) { return (v4f)vfix(x); }
 PS2_VU_INLINE v4u vout(v4f f) { return vfix((v4u)f); }
 PS2_VU_INLINE v4f vnorm(v4f f) { return (v4f)vfix((v4u)f); }
+// Lane-wise chop_add: a sum rounded away from zero steps one ulp back.
+PS2_VU_INLINE v4f vchop_add(v4f a, v4f b) {
+    const v4f s = a + b, bv = s - a, e = (a - (s - bv)) + (b - bv);
+    const v4i away = (e != 0.0f) & (((v4i)e ^ (v4i)s) < 0);
+    return (v4f)((v4i)s + away);
+}
 // The n variants take operands that already went through vfix.
-PS2_VU_INLINE v4u vaddn(v4u a, v4u b) { return vout((v4f)a + (v4f)b); }
-PS2_VU_INLINE v4u vsubn(v4u a, v4u b) { return vout((v4f)a - (v4f)b); }
+PS2_VU_INLINE v4u vaddn(v4u a, v4u b) { return vout(vchop_add((v4f)a, (v4f)b)); }
+PS2_VU_INLINE v4u vsubn(v4u a, v4u b) { return vout(vchop_add((v4f)a, -(v4f)b)); }
 PS2_VU_INLINE v4u vmuln(v4u a, v4u b) { return vout((v4f)a * (v4f)b); }
-PS2_VU_INLINE v4u vmaddn(v4u acc, v4u a, v4u b) { return vout((v4f)acc + vnorm((v4f)a * (v4f)b)); }
-PS2_VU_INLINE v4u vmsubn(v4u acc, v4u a, v4u b) { return vout((v4f)acc - vnorm((v4f)a * (v4f)b)); }
+PS2_VU_INLINE v4u vmaddn(v4u acc, v4u a, v4u b) { return vout(vchop_add((v4f)acc, vnorm((v4f)a * (v4f)b))); }
+PS2_VU_INLINE v4u vmsubn(v4u acc, v4u a, v4u b) { return vout(vchop_add((v4f)acc, -vnorm((v4f)a * (v4f)b))); }
 PS2_VU_INLINE v4u vadd(v4u a, v4u b) { return vaddn(vfix(a), vfix(b)); }
 PS2_VU_INLINE v4u vsub(v4u a, v4u b) { return vsubn(vfix(a), vfix(b)); }
 PS2_VU_INLINE v4u vmul(v4u a, v4u b) { return vmuln(vfix(a), vfix(b)); }
 PS2_VU_INLINE v4u vmadd(v4u acc, v4u a, v4u b) { return vmaddn(vfix(acc), vfix(a), vfix(b)); }
 PS2_VU_INLINE v4u vmsub(v4u acc, v4u a, v4u b) { return vmsubn(vfix(acc), vfix(a), vfix(b)); }
+// Raw sign-magnitude order, no flush: MAXi/MINIi load integer constants through I.
 PS2_VU_INLINE v4i vkey(v4u x) {
-    const v4u zero = (v4u)((x & 0x7F800000u) == 0u);
-    const v4u f = (x & ~zero) | (x & 0x80000000u & zero);
-    const v4i m = (v4i)(f & 0x7FFFFFFFu);
-    const v4i negative = (v4i)((f & 0x80000000u) != 0u);
-    return (m & ~negative) | (-m & negative);
+    const v4i s = (v4i)x;
+    return s ^ ((s >> 31) & 0x7FFFFFFF);
 }
 PS2_VU_INLINE v4u vmax(v4u a, v4u b) {
     const v4u ge = (v4u)(vkey(a) >= vkey(b));
@@ -234,6 +251,9 @@ struct FlagPipe {
     std::uint32_t t = 16;
     std::uint32_t mac_ts[8] = {}, mac_v[8] = {}, status_v[8] = {}, clip_ts[8] = {}, clip_v[8] = {};
     unsigned mh = 0, ch = 0;
+    // FDIV (Q) and EFU (P) results land `latency` cycles after issue; software-pipelined
+    // microcode reads the previous value until then. qt/pt: ready time, 0 when idle.
+    std::uint32_t qt = 0, pt = 0, qv = 0, pv = 0;
 
     void start(const Vu0Regs &r) {
         for (int i = 0; i < 8; ++i) {
@@ -242,6 +262,59 @@ struct FlagPipe {
             status_v[i] = r.status;
             clip_v[i] = r.clip;
         }
+        qt = r.qwait ? t + r.qwait : 0;
+        pt = r.pwait ? t + r.pwait : 0;
+        qv = r.qnext;
+        pv = r.pnext;
+    }
+    PS2_VU_INLINE void sync_q(Vu0Regs &r) {
+        if (qt && t >= qt) {
+            r.q = qv;
+            qt = 0;
+        }
+    }
+    PS2_VU_INLINE void sync_p(Vu0Regs &r) {
+        if (pt && t >= pt) {
+            r.p = pv;
+            pt = 0;
+        }
+    }
+    PS2_VU_INLINE void wait_q(Vu0Regs &r) {
+        if (qt) r.q = qv;
+        qt = 0;
+    }
+    PS2_VU_INLINE void wait_p(Vu0Regs &r) {
+        if (pt) r.p = pv;
+        pt = 0;
+    }
+    // A second issue stalls until the first lands; starting from its ready time stands in for the stall.
+    PS2_VU_INLINE void issue_q(Vu0Regs &r, std::uint32_t v, std::uint32_t latency) {
+        if (qt > t) t = qt;  // the pair stalls until the unit frees: time moves on
+        wait_q(r);
+        qv = v;
+        qt = t + latency;
+    }
+    PS2_VU_INLINE void issue_p(Vu0Regs &r, std::uint32_t v, std::uint32_t latency) {
+        if (pt > t) t = pt;  // the pair stalls until the unit frees: time moves on
+        wait_p(r);
+        pv = v;
+        pt = t + latency;
+    }
+    // The E-bit flushes both units, so the next program starts with Q and P settled.
+    PS2_VU_INLINE void finish(Vu0Regs &r) {
+        wait_q(r);
+        wait_p(r);
+        r.qwait = r.pwait = 0;
+    }
+    // Leaving for another entry mid-program (jr, unsupported op) is not a program boundary:
+    // hand what is still in flight to the next run's start().
+    void park(Vu0Regs &r) {
+        sync_q(r);
+        sync_p(r);
+        r.qwait = static_cast<std::uint16_t>(qt ? qt - t : 0);
+        r.pwait = static_cast<std::uint16_t>(pt ? pt - t : 0);
+        r.qnext = qv;
+        r.pnext = pv;
     }
     PS2_VU_INLINE void set_mac(std::uint32_t mac, std::uint32_t status) {
         const unsigned i = mh++ & 7u;
@@ -297,7 +370,7 @@ PS2_VU_INLINE float u2f(std::uint32_t v) {
     return f;
 }
 
-inline void efu(Vu0Regs &r, unsigned index, unsigned fs, unsigned fsf) {
+inline std::uint32_t efu_value(const Vu0Regs &r, unsigned index, unsigned fs, unsigned fsf) {
     switch (index) {
     case 0x70: case 0x71: case 0x72: case 0x73: {
         const float x = u2f(r.vf[fs].w[0]), y = u2f(r.vf[fs].w[1]), z = u2f(r.vf[fs].w[2]);
@@ -306,20 +379,38 @@ inline void efu(Vu0Regs &r, unsigned index, unsigned fs, unsigned fsf) {
         if (index == 0x71) p = sum != 0.0f ? 1.0f / sum : 3.4e38f;
         if (index == 0x72) p = std::sqrt(sum);
         if (index == 0x73) p = sum != 0.0f ? 1.0f / std::sqrt(sum) : 3.4e38f;
-        r.p = f2u(p);
-        break;
+        return f2u(p);
     }
-    case 0x74: r.p = f2u(std::atan2(u2f(r.vf[fs].w[1]), u2f(r.vf[fs].w[0]))); break;
-    case 0x75: r.p = f2u(std::atan2(u2f(r.vf[fs].w[2]), u2f(r.vf[fs].w[0]))); break;
-    case 0x76: r.p = f2u(u2f(r.vf[fs].w[0]) + u2f(r.vf[fs].w[1]) + u2f(r.vf[fs].w[2]) + u2f(r.vf[fs].w[3])); break;
-    case 0x78: r.p = f2u(std::sqrt(std::fabs(u2f(r.vf[fs].w[fsf])))); break;
-    case 0x79: { const float v = std::sqrt(std::fabs(u2f(r.vf[fs].w[fsf]))); r.p = f2u(v != 0.0f ? 1.0f / v : 3.4e38f); break; }
-    case 0x7A: { const float v = u2f(r.vf[fs].w[fsf]); r.p = f2u(v != 0.0f ? 1.0f / v : 3.4e38f); break; }
-    case 0x7C: r.p = f2u(std::sin(u2f(r.vf[fs].w[fsf]))); break;
-    case 0x7D: r.p = f2u(std::atan(u2f(r.vf[fs].w[fsf]))); break;
-    case 0x7E: r.p = f2u(std::exp(-u2f(r.vf[fs].w[fsf]))); break;
-    default: break;
+    case 0x74: return f2u(std::atan2(u2f(r.vf[fs].w[1]), u2f(r.vf[fs].w[0])));
+    case 0x75: return f2u(std::atan2(u2f(r.vf[fs].w[2]), u2f(r.vf[fs].w[0])));
+    case 0x76: return f2u(u2f(r.vf[fs].w[0]) + u2f(r.vf[fs].w[1]) + u2f(r.vf[fs].w[2]) + u2f(r.vf[fs].w[3]));
+    case 0x78: return f2u(std::sqrt(std::fabs(u2f(r.vf[fs].w[fsf]))));
+    case 0x79: { const float v = std::sqrt(std::fabs(u2f(r.vf[fs].w[fsf]))); return f2u(v != 0.0f ? 1.0f / v : 3.4e38f); }
+    case 0x7A: { const float v = u2f(r.vf[fs].w[fsf]); return f2u(v != 0.0f ? 1.0f / v : 3.4e38f); }
+    case 0x7C: return f2u(std::sin(u2f(r.vf[fs].w[fsf])));
+    case 0x7D: return f2u(std::atan(u2f(r.vf[fs].w[fsf])));
+    case 0x7E: return f2u(std::exp(-u2f(r.vf[fs].w[fsf])));
+    default: return r.p;
     }
+}
+
+// EFU latencies by index & 15: ESADD ERSADD ELENG ERLENG EATANxy EATANxz ESUM - ESQRT ERSQRT ERCPR - ESIN EATAN EEXP.
+inline constexpr std::uint8_t kEfuLatency[16] = {11, 18, 18, 24, 54, 54, 12, 0, 12, 18, 12, 0, 29, 54, 44, 0};
+
+PS2_VU_INLINE void efu(Vu0Regs &r, FlagPipe &fl, unsigned index, unsigned fs, unsigned fsf) {
+    fl.issue_p(r, efu_value(r, index, fs, fsf), kEfuLatency[index & 15u]);
+}
+
+PS2_VU_INLINE void qdiv(Vu0Regs &r, FlagPipe &fl, std::uint32_t s, std::uint32_t t) {
+    const fp::Result x = fp::div(s, t);
+    r.status = (r.status & ~0x30u) | (x.invalid ? 0x20u : 0u);
+    fl.issue_q(r, x.value, 7);
+}
+PS2_VU_INLINE void qsqrt(Vu0Regs &r, FlagPipe &fl, std::uint32_t t) { fl.issue_q(r, fp::sqrt(t), 7); }
+PS2_VU_INLINE void qrsqrt(Vu0Regs &r, FlagPipe &fl, std::uint32_t s, std::uint32_t t) {
+    const fp::Result x = fp::rsqrt(s, t);
+    r.status = (r.status & ~0x30u) | (x.invalid ? 0x20u : 0u);
+    fl.issue_q(r, x.value, 13);
 }
 
 }

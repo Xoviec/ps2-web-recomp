@@ -4,6 +4,8 @@
 #include <webgpu/webgpu.h>
 #ifndef __EMSCRIPTEN__
 #include <webgpu/wgpu.h>
+#else
+#include <emscripten.h>
 #endif
 
 #include <algorithm>
@@ -20,6 +22,21 @@
 extern const char kGsShader[];
 extern const char kBlitShader[];
 
+#ifdef __EMSCRIPTEN__
+// The browser never blocks a WebGPU submit, so when the GPU is the bottleneck whole frames pile up in its
+// queue and what is on screen trails the input by that many frames. Each presented frame records a
+// promise for its completion, and a new frame waits until fewer than `limit` are still running.
+EM_JS_DEPS(ps2gpu, "$WebGPU");
+EM_JS(void, ps2gpu_frame_submitted, (WGPUQueue queue), {
+    const q = WebGPU.getJsObject(queue);
+    (Module.gpuFrames ||= []).push(q.onSubmittedWorkDone());
+});
+EM_ASYNC_JS(void, ps2gpu_frame_throttle, (int limit), {
+    const frames = Module.gpuFrames;
+    while (frames && frames.length >= limit) await frames.shift();
+});
+#endif
+
 namespace ps2::gs {
 void swizzle_tables(std::vector<std::uint32_t> &out);
 }
@@ -28,8 +45,8 @@ namespace ps2::gs::gpu {
 
 namespace {
 
-enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kPipelines };
-const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode"};
+enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kRasterDirect, kPipelines };
+const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode", "raster_direct"};
 
 constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
@@ -483,6 +500,14 @@ void plan_decodes(std::uint32_t prims) {
     }
 }
 
+// PSMCT24 and PSMZ24 writes leave the top byte of each word alone, and PSMT8H/4HL/4HH textures read
+// only that byte (games keep 8-bit textures in the spare byte of a 24-bit Z buffer), so such a texture
+// can be read while the buffer is being drawn without splitting the batch or snapshotting it.
+bool disjoint_bits(std::uint32_t tpsm, std::uint32_t wpsm) {
+    const bool high = tpsm == PSMT8H || tpsm == PSMT4HL || tpsm == PSMT4HH;
+    return high && (wpsm == PSMCT24 || wpsm == PSMZ24);
+}
+
 std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32_t &hi) {
     Batch &b = g_batch;
     lo = hi = 0;
@@ -500,7 +525,8 @@ std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32
         if (!(setup[0] & 2u) || reads_own_word(rec, setup)) continue;
         const int tw = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1), th = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1);
         const Range t = read_range(rec, setup, region(setup[12], setup[13], setup[14], 0, 0, tw - 1, th - 1));
-        for (const Range *w : {&fb, b.zwrite ? &z : nullptr})
+        const Range *fb_w = disjoint_bits(setup[14], b.fpsm) ? nullptr : &fb, *z_w = b.zwrite && !disjoint_bits(setup[14], b.zpsm) ? &z : nullptr;
+        for (const Range *w : {fb_w, z_w})
             if (w && t.overlaps(w->lo, w->hi)) shared.add(std::max(t.lo, w->lo), std::min(t.hi, w->hi));
     }
     if (shared.lo >= shared.hi) return 0;
@@ -578,7 +604,8 @@ void flush_batch() {
     const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi);
     const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi});
     note_raster(prims, tiles, total, snapshot);
-    g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
+    // Tiles holding many primitives are worth the per-pixel sorting of the raster entry point.
+    g_commands.push_back({total >= 4 * tiles ? kRaster : kRasterDirect, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
     b.prims.clear();
@@ -1367,7 +1394,8 @@ void draw(const State &st, const Vertex *v, int count) {
     if (flags & 2u) {
         if (!b.prims.empty()) {
             batch_ranges();
-            const auto written = [&](const Range &t) { return t.overlaps(b.fb_range.lo, b.fb_range.hi) || (b.zwrite && t.overlaps(b.z_range.lo, b.z_range.hi)); };
+            const bool fb_bits = !disjoint_bits(setup[14], b.fpsm), z_bits = b.zwrite && !disjoint_bits(setup[14], b.zpsm);
+            const auto written = [&](const Range &t) { return (fb_bits && t.overlaps(b.fb_range.lo, b.fb_range.hi)) || (z_bits && t.overlaps(b.z_range.lo, b.z_range.hi)); };
             int rect[4];
             if (written(tex)) {
                 if (!texel_rect(setup, v, count, prim, fst, rect)) {
@@ -1376,8 +1404,8 @@ void draw(const State &st, const Vertex *v, int count) {
                     const Range used = region(setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3]);
                     const bool small = rect[2] - rect[0] < 64 && rect[3] - rect[1] < 64;
                     const bool cached = b.texflushes == g_texflushes && small && shares_frame(setup, b);
-                    const bool frame = !cached && (shares_frame(setup, b) ? drawn_under(b, rect) : used.overlaps(b.fb_range.lo, b.fb_range.hi));
-                    if (frame || (b.zwrite && used.overlaps(b.z_range.lo, b.z_range.hi))) emit_all();
+                    const bool frame = fb_bits && !cached && (shares_frame(setup, b) ? drawn_under(b, rect) : used.overlaps(b.fb_range.lo, b.fb_range.hi));
+                    if (frame || (z_bits && used.overlaps(b.z_range.lo, b.z_range.hi))) emit_all();
                 }
             }
         }
@@ -1614,7 +1642,7 @@ void stats() {
     if (g_mode == Mode::off) return;
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
-    std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "\n[gpu] busy %.1f ms (%llu of %llu passes timed)\n", busy_ms(), static_cast<unsigned long long>(g_measured), static_cast<unsigned long long>(g_total_passes));
 }
 
 void configure_surface() {
@@ -1737,6 +1765,11 @@ bool has_surface() { return g_surface != nullptr; }
 
 bool present(const DisplaySource &src) {
     if (!g_surface) return false;
+#ifdef __EMSCRIPTEN__
+    // before getCurrentTexture: the canvas texture must not be held across an await
+    static const int frames_in_flight = std::getenv("PS2_GPU_FRAMES") ? std::max(1, std::atoi(std::getenv("PS2_GPU_FRAMES"))) : 3;
+    ps2gpu_frame_throttle(frames_in_flight);
+#endif
     flush_all();
     const std::uint32_t current = field_base(g_field), previous = field_base(g_field + 1);
     static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
@@ -1763,6 +1796,8 @@ bool present(const DisplaySource &src) {
     submit(target);
 #ifndef __EMSCRIPTEN__
     wgpuSurfacePresent(g_surface);
+#else
+    ps2gpu_frame_submitted(g_queue);
 #endif
     wgpuTextureViewRelease(target);
     wgpuTextureRelease(st.texture);

@@ -492,7 +492,14 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     }
     case 0x19: case 0x1F: case 0xFD: case 0xFF: g_alarms.erase(static_cast<int>(arg(c, 0))); ret(c, 0); break;
     case 0x20: ret(c, create_thread(c)); break;
-    case 0x21: g_threads.erase(static_cast<int>(arg(c, 0))); ret(c, 0); break;
+    case 0x21: {  // DeleteThread: only a dormant thread other than the caller (ps2autotests kernel/ee/thread/delete)
+        const int id = static_cast<int>(arg(c, 0));
+        auto it = g_threads.find(id);
+        if (id == 0 || id == g_current || it == g_threads.end() || it->second.status != kDormant) { ret(c, -1); break; }
+        g_threads.erase(it);
+        ret(c, id);
+        break;
+    }
     case 0x22: {
         Thread *t = thread(static_cast<int>(arg(c, 0)));
         if (!t) { ret(c, -1); break; }

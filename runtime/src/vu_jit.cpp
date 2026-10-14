@@ -11,7 +11,7 @@ namespace ps2::vu::jit {
 
 const char *const kImportNames[kImports] = {
     "clip_value", "clip_post", "set_clip", "start", "mac", "status", "clip", "force_mac", "mul", "msub", "to_fixed", "from_fixed",
-    "div", "sqrt", "rsqrt", "efu", "kick", "top", "itop", "rand_next", "interpret",
+    "div", "sqrt", "rsqrt", "efu", "kick", "top", "itop", "rand_next", "interpret", "pipe",
 };
 
 namespace {
@@ -26,12 +26,12 @@ struct ImportType {
 
 constexpr ImportType kImportTypes[kImports] = {
     {3, true}, {3, false}, {3, false}, {2, false}, {1, true}, {1, true}, {1, true}, {2, false}, {2, true}, {3, true}, {2, true}, {2, true},
-    {3, false}, {2, false}, {3, false}, {4, false}, {1, false}, {0, true}, {0, true}, {1, true}, {1, false},
+    {3, false}, {2, false}, {3, false}, {4, false}, {1, false}, {0, true}, {0, true}, {1, true}, {1, false}, {2, false},
 };
 
 enum Local : std::uint32_t {
     kR, kMem, kPend, kPendj, kEnding, kJpc, kPcw, kUclip, kUx, kUy, kUz, kUw, kTmp, kTmp2, kMacv, kStat, kSlot, kI32Locals,
-    kUv = kI32Locals, kV0, kV1, kV2, kV3, kV4, kV5, kShadow0
+    kUv = kI32Locals, kV0, kV1, kV2, kV3, kV4, kShadow0
 };
 constexpr std::uint32_t kI32Count = kI32Locals - 2;
 constexpr std::uint32_t kVecTemps = kShadow0 - kUv;
@@ -168,7 +168,8 @@ enum : std::uint8_t {
 
 enum : std::uint32_t {
     kVSplat = 0x11, kVExtract = 0x1B, kI32x4Eq = 0x37, kI32x4LtS = 0x39, kI32x4LeS = 0x3D, kI32x4GeS = 0x3F, kF32x4Ge = 0x46,
-    kVAnd = 0x4E, kVOr = 0x50, kVBitselect = 0x52, kI32x4Neg = 0xA1, kI32x4MinS = 0xB6, kF32x4Add = 0xE4, kF32x4Sub = 0xE5, kF32x4Mul = 0xE6,
+    kVAnd = 0x4E, kVOr = 0x50, kVXor = 0x51, kVBitselect = 0x52, kI32x4MinS = 0xB6, kF32x4Add = 0xE4, kF32x4Sub = 0xE5, kF32x4Mul = 0xE6,
+    kF32x4Ne = 0x42, kF32x4Neg = 0xE1, kI32x4Add = 0xAE,
 };
 
 enum Kind { Nop, Add, Sub, Madd, Msub, Max, Min, Mul, Abs, Ftoi, Itof, Clip, Opmula, Opmsub };
@@ -374,6 +375,11 @@ private:
     }
 
     void fl() { c_.i32c(layout_.flags); }
+    void pipe(PipeOp op) {
+        c_.get(kR);
+        c_.i32c(op);
+        c_.call(kPipe);
+    }
     std::uint32_t top_depth() const { return static_cast<std::uint32_t>(pcs_.size()) - case_index_ + c_.depth; }
 
     void vfix() {
@@ -393,27 +399,48 @@ private:
         c_.simd(kVOr);
     }
 
-    void vkey_of(std::uint32_t local) {
-        c_.get(local);
-        c_.vsplatc(0x80000000u);
-        c_.simd(kVAnd);
-        c_.get(local);
-        c_.get(local);
-        c_.vsplatc(0x7F800000u);
-        c_.simd(kVAnd);
-        c_.vsplatc(0);
-        c_.simd(kI32x4Eq);
-        c_.simd(kVBitselect);
-        c_.tee(kV4);
-        c_.vsplatc(0x7FFFFFFFu);
-        c_.simd(kVAnd);
-        c_.tee(kV5);
-        c_.simd(kI32x4Neg);
-        c_.get(kV5);
+    // a b -> a + b rounded toward zero, like the VU adder (vuops::chop_add): round to nearest,
+    // then step one ulp back where the TwoSum error shows the sum went away from zero.
+    void chop_add() {
+        c_.set(kV1);
+        c_.tee(kV0);
+        c_.get(kV1);
+        c_.simd(kF32x4Add);
+        c_.tee(kV2);
+        c_.get(kV0);
+        c_.simd(kF32x4Sub);
+        c_.set(kV3);
+        c_.get(kV0);
+        c_.get(kV2);
+        c_.get(kV3);
+        c_.simd(kF32x4Sub);
+        c_.simd(kF32x4Sub);
+        c_.get(kV1);
+        c_.get(kV3);
+        c_.simd(kF32x4Sub);
+        c_.simd(kF32x4Add);
+        c_.set(kV4);
+        c_.get(kV2);
         c_.get(kV4);
         c_.vsplatc(0);
+        c_.simd(kF32x4Ne);
+        c_.get(kV4);
+        c_.get(kV2);
+        c_.simd(kVXor);
+        c_.vsplatc(0);
         c_.simd(kI32x4LtS);
-        c_.simd(kVBitselect);
+        c_.simd(kVAnd);
+        c_.simd(kI32x4Add);
+    }
+
+    void vkey_of(std::uint32_t local) {
+        c_.get(local);
+        c_.get(local);
+        c_.vsplatc(0);
+        c_.simd(kI32x4LtS);
+        c_.vsplatc(0x7FFFFFFFu);
+        c_.simd(kVAnd);
+        c_.simd(kVXor);
     }
 
     void raw_vec(unsigned reg) {
@@ -622,6 +649,7 @@ void Translator::upper_pre(const Up &u, bool flags_live) {
         return;
     }
     if (!active(u, flags_live)) return;
+    if (u.src == Q) pipe(kSyncQ);
     if (arithmetic(u.kind)) {
         if (u.kind == Madd || u.kind == Msub) c_.get(shadow_.at(kAcc));
         shadow_vec(u.fs);
@@ -651,19 +679,24 @@ void Translator::upper_pre(const Up &u, bool flags_live) {
             break;
         }
         switch (u.kind) {
-        case Add: c_.simd(kF32x4Add); vfix(); break;
-        case Sub: c_.simd(kF32x4Sub); vfix(); break;
+        case Add: chop_add(); vfix(); break;
+        case Sub:
+            c_.simd(kF32x4Neg);
+            chop_add();
+            vfix();
+            break;
         case Mul: c_.simd(kF32x4Mul); vfix(); break;
         case Madd:
             c_.simd(kF32x4Mul);
             vfix();
-            c_.simd(kF32x4Add);
+            chop_add();
             vfix();
             break;
         default:
             c_.simd(kF32x4Mul);
             vfix();
-            c_.simd(kF32x4Sub);
+            c_.simd(kF32x4Neg);
+            chop_add();
             vfix();
             break;
         }
@@ -912,7 +945,7 @@ bool Translator::lower(std::uint32_t w, std::uint32_t pc) {
             mem_lane(ft, ftf);
             c_.call(kRsqrt);
             break;
-        case 0x3B: break;
+        case 0x3B: pipe(kWaitQ); break;
         case 0x3C: set_vi(it, [&] { mem_lane(fs, fsf); }); break;
         case 0x3D:
             if (ft) {
@@ -990,6 +1023,7 @@ bool Translator::lower(std::uint32_t w, std::uint32_t pc) {
             break;
         case 0x64:
             if (ft) {
+                pipe(kSyncP);
                 c_.get(kR);
                 c_.load(kOffP);
                 c_.set(kTmp);
@@ -1009,7 +1043,7 @@ bool Translator::lower(std::uint32_t w, std::uint32_t pc) {
             c_.i32c(fsf);
             c_.call(kEfu);
             break;
-        case 0x7B: break;
+        case 0x7B: pipe(kWaitP); break;
         default: return false;
         }
         return true;
@@ -1157,8 +1191,6 @@ bool Translator::lower(std::uint32_t w, std::uint32_t pc) {
             c_.op(kOpOr);
             c_.i32c(0xFFFu);
             c_.op(kOpAnd);
-            c_.i32c(0xFFFu);
-            c_.op(kOpEq);
         });
         break;
     case 0x18:
@@ -1184,8 +1216,6 @@ bool Translator::lower(std::uint32_t w, std::uint32_t pc) {
             c_.op(kOpOr);
             c_.i32c(0xFFFFu);
             c_.op(kOpAnd);
-            c_.i32c(0xFFFFu);
-            c_.op(kOpEq);
         });
         break;
     case 0x1C:
@@ -1326,6 +1356,13 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
             c_.i32c(lo);
             c_.store(kOffI);
         } else if (!li.supported || !lower(lo, pc)) {
+            // The interpreter reruns this instruction, so hand over the clock from before it.
+            fl();
+            fl();
+            c_.load(kOffT);
+            c_.i32c(1);
+            c_.op(kOpSub);
+            c_.store(kOffT);
             c_.i32c(pc);
             c_.tail(kInterpret);
         }
@@ -1365,6 +1402,7 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
             if (word(prev + 4) & 0x40000000u) {
                 c_.get(kEnding);
                 c_.open_if();
+                pipe(kFinish);
                 c_.get(kR);
                 c_.i32c((pc + 8u) & kMask);
                 c_.store(kOffTpc);

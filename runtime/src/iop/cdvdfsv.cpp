@@ -5,6 +5,7 @@
 #include "ps2/memory.hpp"
 
 #include "ps2/state.hpp"
+#include "ps2/system.hpp"
 
 #include <cstdio>
 #include <ctime>
@@ -62,7 +63,7 @@ void install_cdvdfsv() {
     sif::register_hle_server(0x80000593u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t ret_size) {
         switch (method) {
         case 0x01: {
-            const std::time_t t = std::time(nullptr);
+            const std::time_t t = ps2::rtc_time();
             const std::tm *tm = std::gmtime(&t);
             set_ee32(ret, 1);
             std::uint8_t *clock = ps2::g_ram + ret + 4;

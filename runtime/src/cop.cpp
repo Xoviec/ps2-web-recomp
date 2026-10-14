@@ -1,4 +1,6 @@
 #include "hw.hpp"
+#include "gs/queue.hpp"
+#include "vu_micro.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/system.hpp"
 
@@ -6,14 +8,15 @@
 
 namespace ps2 {
 
+// FCR1-15 read as FCR0 and FCR16-30 as FCR31; bits 0 and 24 of FCR31 always read 1 and
+// only C, the sticky and cause flags are writable (ps2autotests cpu/ee_fpu/fcr, transfer).
 std::uint32_t cfc1(Cpu &c, std::uint32_t reg) {
-    if (reg == 0) return 0x2E30u;
-    if (reg == 31) return c.fcr31;
-    return 0;
+    if (reg < 16) return 0x2E30u;
+    return c.fcr31 | 0x01000001u;
 }
 
 void ctc1(Cpu &c, std::uint32_t reg, std::uint32_t value) {
-    if (reg == 31) c.fcr31 = value;
+    if (reg >= 16) c.fcr31 = (value & 0x0083C078u) | 0x01000001u;
 }
 
 std::uint32_t cfc2(Cpu &c, std::uint32_t reg) {
@@ -25,7 +28,7 @@ std::uint32_t cfc2(Cpu &c, std::uint32_t reg) {
     case 20: return v.r;
     case 21: return v.i;
     case 22: return v.q;
-    case 26: return v.tpc;
+    case 26: return v.tpc >> 3;  // TPC counts instructions; vu tpc() keeps bytes for MSCNT
     case 27: return v.cmsar0;
     case 29: return 0;
     default:
@@ -38,15 +41,16 @@ void ctc2(Cpu &c, std::uint32_t reg, std::uint32_t value) {
     Vu0Regs &v = c.vu0;
     switch (reg) {
     case 16: v.status = (v.status & 0x3Fu) | (value & 0xFC0u); break;
-    case 17: v.mac = value; break;
+    case 17: break;  // MAC flags are read-only
     case 18: v.clip = value & 0xFFFFFFu; break;
     case 20: v.r = value & 0x7FFFFFu; break;
     case 21: v.i = value; break;
     case 22: v.q = value; break;
     case 27: v.cmsar0 = value & 0xFFFFu; break;
     case 28: break;
-    case 31:
-        std::fprintf(stderr, "[vu1] start at 0x%X through CMSAR1 (not implemented)\n", value);
+    case 31:  // CMSAR1: starts VU1 at value * 8
+        if (gs::queue::vu_active()) std::fprintf(stderr, "[vu1] start at 0x%X through CMSAR1 while VU1 runs on its thread\n", value);
+        else vu::run(1, (value & 0xFFFFu) * 8u);
         break;
     default:
         std::fprintf(stderr, "[vu0] ctc2 %u = 0x%08X\n", reg, value);

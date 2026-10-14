@@ -210,7 +210,7 @@ bool halted() { return g_halted; }
 namespace {
 
 constexpr char kStateMagic[8] = {'P', 'S', '2', 'S', 'T', 'A', 'T', 'E'};
-constexpr std::uint32_t kStateVersion = 2;
+constexpr std::uint32_t kStateVersion = 4;
 
 std::function<void()> event_action(int id) {
     if (id == hw::kEventVblank) return vblank;
@@ -437,6 +437,9 @@ void run_vu_thread() {
             switch (h.type) {
             case gs::queue::kVif1: vif::transfer(1, payload, h.arg0); break;
             case gs::queue::kVif1Write: vif::write(1, h.arg0, h.arg1); break;
+            case gs::queue::kGif: gif::transfer(static_cast<int>(h.arg0), payload, h.arg1); break;
+            case gs::queue::kGifReset: gif::reset(); break;
+            case gs::queue::kPath3Flush: gif::path3_flush(); break;
             case gs::queue::kVuReset:
                 vif::reset_vu_side();
                 vu::reset();

@@ -3,6 +3,8 @@
 #include "cpu.hpp"
 
 #include <cstdint>
+#include <cstdlib>
+#include <ctime>
 #include <functional>
 #include <string>
 #include <vector>
@@ -77,6 +79,12 @@ bool load_state(const std::string &path);
 bool load_state(const std::uint8_t *data, std::size_t size);
 bool halted();
 std::uint64_t frame_count();
+// Seconds since the epoch for the emulated real-time clock. PS2_RTC=<unix time> pins it, so headless
+// regression runs (scripts/regress.sh) do not depend on when they were started.
+inline std::time_t rtc_time() {
+    static const char *pin = std::getenv("PS2_RTC");
+    return pin ? static_cast<std::time_t>(std::strtoll(pin, nullptr, 10)) : std::time(nullptr);
+}
 
 bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 

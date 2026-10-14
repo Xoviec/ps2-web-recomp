@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <fstream>
 #include <vector>
@@ -170,13 +171,111 @@ std::uint8_t xor_of(const std::uint8_t *p, std::size_t n) {
     return v;
 }
 
+void page_ecc(std::uint8_t *page) {
+    static std::uint8_t masks[256];
+    static bool ready = false;
+    auto parity = [](unsigned v) { return static_cast<std::uint8_t>(__builtin_popcount(v) & 1); };
+    if (!ready) {
+        static const std::uint8_t kColumn[7] = {0x55, 0x33, 0x0F, 0x00, 0xAA, 0xCC, 0xF0};
+        for (unsigned b = 0; b < 256; ++b) {
+            std::uint8_t m = 0;
+            for (unsigned i = 0; i < 7; ++i) m |= static_cast<std::uint8_t>(parity(b & kColumn[i]) << i);
+            masks[b] = m;
+        }
+        ready = true;
+    }
+    std::uint8_t *spare = page + 512;
+    for (unsigned chunk = 0; chunk < 4; ++chunk) {
+        std::uint8_t column = 0x77, line0 = 0x7F, line1 = 0x7F;
+        for (unsigned i = 0; i < 128; ++i) {
+            const std::uint8_t b = page[chunk * 128 + i];
+            column ^= masks[b];
+            if (parity(b)) {
+                line0 ^= static_cast<std::uint8_t>(~i);
+                line1 ^= static_cast<std::uint8_t>(i);
+            }
+        }
+        spare[chunk * 3 + 0] = column;
+        spare[chunk * 3 + 1] = line0 & 0x7F;
+        spare[chunk * 3 + 2] = line1;
+    }
+}
+
+// A blank card in the layout the PS2 memory card format code produces (8 MB, ECC, 1 KB clusters).
+// Burnout 3's libmc2 mis-sizes the first file it writes right after formatting a card in-game
+// (it reads a stale stack slot left by its own format routine), so new cards start formatted.
+void format_card(std::vector<std::uint8_t> &card) {
+    constexpr std::uint32_t kIndirect = 8, kFatFirst = 9, kFatClusters = 32, kAllocOffset = 41, kAllocEnd = 8135;
+    std::fill(card.begin(), card.end(), 0xFF);
+    auto page = [&](std::uint32_t n) { return card.data() + static_cast<std::size_t>(n) * kPageBytes; };
+    auto put32 = [](std::uint8_t *p, std::uint32_t v) { std::memcpy(p, &v, 4); };
+    auto put16 = [](std::uint8_t *p, std::uint16_t v) { std::memcpy(p, &v, 2); };
+    std::vector<std::uint32_t> touched;
+
+    std::uint8_t *sb = page(0);
+    std::fill_n(sb, 0x150, 0x00);
+    std::memcpy(sb, "Sony PS2 Memory Card Format 1.2.0.0", 35);
+    put16(sb + 0x28, 512);
+    put16(sb + 0x2A, 2);
+    put16(sb + 0x2C, kBlockPages);
+    put16(sb + 0x2E, 0xFF00);
+    put32(sb + 0x30, kPages / 2);
+    put32(sb + 0x34, kAllocOffset);
+    put32(sb + 0x38, kAllocEnd);
+    put32(sb + 0x3C, 0);
+    put32(sb + 0x40, kPages / kBlockPages - 1);
+    put32(sb + 0x44, kPages / kBlockPages - 2);
+    put32(sb + 0x50, kIndirect);
+    std::fill_n(sb + 0xD0, 0x80, 0xFF);
+    sb[0x150] = 2;
+    sb[0x151] = 0x2B;
+    put32(sb + 0x154, 0x400);
+    put32(sb + 0x158, 0x100);
+    put32(sb + 0x15C, 8);
+    put32(sb + 0x160, 0xFFFFFFFFu);
+    std::fill_n(sb + 0x164, 12, 0x00);
+    put32(sb + 0x170, 0x1F41);
+    touched.push_back(0);
+
+    auto cluster_word = [&](std::uint32_t cluster, std::uint32_t index, std::uint32_t v) {
+        put32(page(cluster * 2 + index / 128) + (index % 128) * 4, v);
+    };
+    for (std::uint32_t i = 0; i < kFatClusters; ++i) cluster_word(kIndirect, i, kFatFirst + i);
+    touched.push_back(kIndirect * 2);
+    touched.push_back(kIndirect * 2 + 1);
+    for (std::uint32_t e = 0; e < kFatClusters * 256; ++e)
+        cluster_word(kFatFirst + e / 256, e % 256, e == 0 || e >= kAllocEnd ? 0xFFFFFFFFu : 0x7FFFFFFFu);
+    for (std::uint32_t p = kFatFirst * 2; p < (kFatFirst + kFatClusters) * 2; ++p) touched.push_back(p);
+
+    const std::time_t now = ps2::rtc_time() + 9 * 3600;
+    const std::tm *tm = std::gmtime(&now);
+    std::uint8_t stamp[8] = {0, static_cast<std::uint8_t>(tm->tm_sec), static_cast<std::uint8_t>(tm->tm_min), static_cast<std::uint8_t>(tm->tm_hour),
+                             static_cast<std::uint8_t>(tm->tm_mday), static_cast<std::uint8_t>(tm->tm_mon + 1), 0, 0};
+    put16(stamp + 6, static_cast<std::uint16_t>(tm->tm_year + 1900));
+    auto dirent = [&](std::uint32_t n, std::uint16_t mode, std::uint32_t length, const char *name) {
+        std::uint8_t *e = page(n);
+        std::fill_n(e, 512, 0x00);
+        put16(e, mode);
+        put32(e + 4, length);
+        std::memcpy(e + 0x08, stamp, 8);
+        std::memcpy(e + 0x18, stamp, 8);
+        std::memcpy(e + 0x40, name, std::strlen(name));
+        touched.push_back(n);
+    };
+    dirent(kAllocOffset * 2, 0x8427, 2, ".");
+    dirent(kAllocOffset * 2 + 1, 0xA426, 0, "..");
+
+    for (std::uint32_t n : touched) page_ecc(page(n));
+}
+
 void load_card() {
     if (g_card.present || g_options.memcard_path.empty()) return;
     g_card.data.assign(kCardBytes, 0xFF);
     std::ifstream in(g_options.memcard_path, std::ios::binary);
     if (in) in.read(reinterpret_cast<char *>(g_card.data.data()), static_cast<std::streamsize>(kCardBytes));
+    else format_card(g_card.data);
     g_card.present = true;
-    std::fprintf(stderr, "[mc] card in slot 1: %s%s\n", g_options.memcard_path.c_str(), in ? "" : " (new, unformatted)");
+    std::fprintf(stderr, "[mc] card in slot 1: %s%s\n", g_options.memcard_path.c_str(), in ? "" : " (new, formatted)");
 }
 
 void memory_card(std::size_t at, std::uint32_t out_size) {

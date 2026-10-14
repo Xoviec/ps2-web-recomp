@@ -25,7 +25,10 @@ namespace {
 constexpr std::uint32_t kIntcStat = 0x1000F000u, kIntcMask = 0x1000F010u;
 constexpr std::uint32_t kDmacStat = 0x1000E010u;
 
-std::uint32_t g_intc_stat = 0, g_intc_mask = 0;
+// g_intc_latched is what the guest reads back: the kernel acknowledging an interrupt before
+// running the handlers must not hide it from code that polls INTC_STAT, the way sceGsSyncV
+// waits for VBlank start while a VBlank handler is installed. Only a guest write clears it.
+std::uint32_t g_intc_stat = 0, g_intc_mask = 0, g_intc_latched = 0;
 std::uint32_t g_dmac_stat = 0;
 std::map<std::uint32_t, std::uint64_t> g_regs;
 std::set<std::uint32_t> g_reported;
@@ -108,7 +111,7 @@ bool is_timer(std::uint32_t a) { return a >= 0x10000000u && a < 0x10002000u && (
 }
 
 void reset() {
-    g_intc_stat = g_intc_mask = g_dmac_stat = 0;
+    g_intc_stat = g_intc_mask = g_intc_latched = g_dmac_stat = 0;
     gs::reset();
     gif::reset();
     vif::reset();
@@ -130,6 +133,7 @@ std::uint32_t intc_pending() { return g_intc_stat & g_intc_mask; }
 
 void intc_raise(unsigned cause) {
     g_intc_stat |= 1u << cause;
+    g_intc_latched |= 1u << cause;
     if (g_intc_mask & (1u << cause)) kernel::wake_idle();
 }
 
@@ -176,7 +180,7 @@ void dmac_raise(unsigned channel) {
 }
 
 std::uint32_t read32(std::uint32_t a) {
-    if (a == kIntcStat) return g_intc_stat;
+    if (a == kIntcStat) return g_intc_stat | g_intc_latched;
     if (a == kIntcMask) return g_intc_mask;
     if (a == kDmacStat) return g_dmac_stat;
     if (a >= 0x12000000u && a < 0x12002000u) return static_cast<std::uint32_t>(gs::read_privileged(a & ~7u) >> ((a & 4u) * 8));
@@ -204,7 +208,7 @@ std::uint32_t read32(std::uint32_t a) {
 }
 
 void write32(std::uint32_t a, std::uint32_t v) {
-    if (a == kIntcStat) { g_intc_stat &= ~v; return; }
+    if (a == kIntcStat) { g_intc_stat &= ~v; g_intc_latched &= ~v; return; }
     if (a == kIntcMask) { g_intc_mask ^= v; return; }
     if (a == kDmacStat) {
         g_dmac_stat &= ~(v & 0xFFFFu);

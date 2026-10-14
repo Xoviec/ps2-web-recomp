@@ -887,6 +887,20 @@ void install_modload() {
         if (arg(c, 2)) write32(arg(c, 2), n);
         c.r[2] = 0;
     });
+    def("modload", 18, "GetModuleIdListByName", [](Cpu &c) {
+        std::string name = ram_string(arg(c, 0), 64);
+        for (char &ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        std::uint32_t n = 0;
+        for (const auto &[id, m] : modules()) {
+            std::string a = m.name;
+            for (char &ch : a) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (a != name) continue;
+            if (n < arg(c, 2)) write32(arg(c, 1) + 4 * n, static_cast<std::uint32_t>(id));
+            ++n;
+        }
+        if (arg(c, 3)) write32(arg(c, 3), n);
+        c.r[2] = 0;
+    });
     def("modload", 17, "ReferModuleStatus", [](Cpu &c) {
         auto it = modules().find(static_cast<int>(arg(c, 0)));
         if (it == modules().end()) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownModule); return; }

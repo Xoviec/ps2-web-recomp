@@ -337,9 +337,9 @@ void fast_upper(Vu0Regs &r, const Decoded &d, UpperOut &o) {
         o.value.w[2] = fout(norm(fin(s.w[0]) * fin(t.w[1])));
         return;
     case kOpmsub:
-        o.value.w[0] = fout(fin(r.acc.w[0]) - norm(fin(s.w[1]) * fin(t.w[2])));
-        o.value.w[1] = fout(fin(r.acc.w[1]) - norm(fin(s.w[2]) * fin(t.w[0])));
-        o.value.w[2] = fout(fin(r.acc.w[2]) - norm(fin(s.w[0]) * fin(t.w[1])));
+        o.value.w[0] = fout(vuops::chop_add(fin(r.acc.w[0]), -norm(fin(s.w[1]) * fin(t.w[2]))));
+        o.value.w[1] = fout(vuops::chop_add(fin(r.acc.w[1]), -norm(fin(s.w[2]) * fin(t.w[0]))));
+        o.value.w[2] = fout(vuops::chop_add(fin(r.acc.w[2]), -norm(fin(s.w[0]) * fin(t.w[1]))));
         return;
     default: break;
     }
@@ -351,11 +351,11 @@ void fast_upper(Vu0Regs &r, const Decoded &d, UpperOut &o) {
     case kI: for (int i = 0; i < 4; ++i) b[i] = r.i; break;
     }
     switch (d.kind) {
-    case kAdd: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(s.w[i]) + fin(b[i])); break;
-    case kSub: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(s.w[i]) - fin(b[i])); break;
+    case kAdd: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(vuops::chop_add(fin(s.w[i]), fin(b[i]))); break;
+    case kSub: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(vuops::chop_add(fin(s.w[i]), -fin(b[i]))); break;
     case kMul: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(s.w[i]) * fin(b[i])); break;
-    case kMadd: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(r.acc.w[i]) + norm(fin(s.w[i]) * fin(b[i]))); break;
-    case kMsub: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(r.acc.w[i]) - norm(fin(s.w[i]) * fin(b[i]))); break;
+    case kMadd: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(vuops::chop_add(fin(r.acc.w[i]), norm(fin(s.w[i]) * fin(b[i])))); break;
+    case kMsub: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(vuops::chop_add(fin(r.acc.w[i]), -norm(fin(s.w[i]) * fin(b[i])))); break;
     case kMax: for (int i = 0; i < 4; ++i) o.value.w[i] = fp::max(s.w[i], b[i]); break;
     case kMin: for (int i = 0; i < 4; ++i) o.value.w[i] = fp::min(s.w[i], b[i]); break;
     default: break;
@@ -394,20 +394,6 @@ std::uint8_t *qword(Unit &u, std::uint32_t index) {
 
 void store_vi(Vu0Regs &r, unsigned index, std::uint32_t value) {
     if (index) r.vi[index] = static_cast<std::uint16_t>(value);
-}
-
-std::uint32_t f2u(float f) {
-    std::uint32_t v;
-    std::memcpy(&v, &f, 4);
-    return v;
-}
-
-float u2f(std::uint32_t v) {
-    if (!(v & 0x7F800000u)) v &= 0x80000000u;
-    if ((v & 0x7F800000u) == 0x7F800000u) v = (v & 0x80000000u) | 0x7F7FFFFFu;
-    float f;
-    std::memcpy(&f, &v, 4);
-    return f;
 }
 
 void xgkick(Unit &u, std::uint32_t address) {
@@ -489,10 +475,10 @@ void lower(Unit &u, std::uint32_t w, std::uint32_t pc, std::uint32_t &npc, bool 
             for (int i = 0; i < 4; ++i) if (dest & (8u >> i)) std::memcpy(q + i * 4, &r.vf[fs].w[i], 4);
             break;
         }
-        case 0x38: vu::div(r, r.vf[fs].w[fsf], r.vf[ft].w[ftf]); break;
-        case 0x39: vu::sqrt(r, r.vf[ft].w[ftf]); break;
-        case 0x3A: vu::rsqrt(r, r.vf[fs].w[fsf], r.vf[ft].w[ftf]); break;
-        case 0x3B: break;
+        case 0x38: vuops::qdiv(r, *u.pipe, r.vf[fs].w[fsf], r.vf[ft].w[ftf]); break;
+        case 0x39: vuops::qsqrt(r, *u.pipe, r.vf[ft].w[ftf]); break;
+        case 0x3A: vuops::qrsqrt(r, *u.pipe, r.vf[fs].w[fsf], r.vf[ft].w[ftf]); break;
+        case 0x3B: u.pipe->wait_q(r); break;
         case 0x3C: store_vi(r, it, r.vf[fs].w[fsf]); break;
         case 0x3D: if (ft) { const std::uint32_t v = static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(r.vi[is]))); for (int i = 0; i < 4; ++i) if (dest & (8u >> i)) r.vf[ft].w[i] = v; } break;
         case 0x3E: {
@@ -523,26 +509,10 @@ void lower(Unit &u, std::uint32_t w, std::uint32_t pc, std::uint32_t &npc, bool 
         case 0x68: store_vi(r, it, g_top); break;
         case 0x69: store_vi(r, it, g_itop); break;
         case 0x6C: xgkick(u, r.vi[is]); break;
-        case 0x70: case 0x71: case 0x72: case 0x73: {
-            const float x = u2f(r.vf[fs].w[0]), y = u2f(r.vf[fs].w[1]), z = u2f(r.vf[fs].w[2]);
-            const float sum = x * x + y * y + z * z;
-            float p = sum;
-            if (index == 0x71) p = sum != 0.0f ? 1.0f / sum : 3.4e38f;
-            if (index == 0x72) p = std::sqrt(sum);
-            if (index == 0x73) p = sum != 0.0f ? 1.0f / std::sqrt(sum) : 3.4e38f;
-            r.p = f2u(p);
+        case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x78: case 0x79: case 0x7A: case 0x7C: case 0x7D: case 0x7E:
+            vuops::efu(r, *u.pipe, index, fs, fsf);
             break;
-        }
-        case 0x74: r.p = f2u(std::atan2(u2f(r.vf[fs].w[1]), u2f(r.vf[fs].w[0]))); break;
-        case 0x75: r.p = f2u(std::atan2(u2f(r.vf[fs].w[2]), u2f(r.vf[fs].w[0]))); break;
-        case 0x76: r.p = f2u(u2f(r.vf[fs].w[0]) + u2f(r.vf[fs].w[1]) + u2f(r.vf[fs].w[2]) + u2f(r.vf[fs].w[3])); break;
-        case 0x78: r.p = f2u(std::sqrt(std::fabs(u2f(r.vf[fs].w[fsf])))); break;
-        case 0x79: { const float v = std::sqrt(std::fabs(u2f(r.vf[fs].w[fsf]))); r.p = f2u(v != 0.0f ? 1.0f / v : 3.4e38f); break; }
-        case 0x7A: { const float v = u2f(r.vf[fs].w[fsf]); r.p = f2u(v != 0.0f ? 1.0f / v : 3.4e38f); break; }
-        case 0x7B: break;
-        case 0x7C: r.p = f2u(std::sin(u2f(r.vf[fs].w[fsf]))); break;
-        case 0x7D: r.p = f2u(std::atan(u2f(r.vf[fs].w[fsf]))); break;
-        case 0x7E: r.p = f2u(std::exp(-u2f(r.vf[fs].w[fsf]))); break;
+        case 0x7B: u.pipe->wait_p(r); break;
         default:
             if (g_reported++ < 32) std::fprintf(stderr, "[vu] lower special 0x%X (0x%08X) at 0x%04X\n", index, w, pc);
             break;
@@ -593,10 +563,10 @@ void lower(Unit &u, std::uint32_t w, std::uint32_t pc, std::uint32_t &npc, bool 
         if (u.pipe) u.pipe->force_mac(r.mac, r.status);
         break;
     case 0x16: store_vi(r, it, status_flags() & (((w >> 10) & 0x800u) | (w & 0x7FFu))); break;
-    case 0x17: store_vi(r, it, ((status_flags() | (((w >> 10) & 0x800u) | (w & 0x7FFu))) & 0xFFFu) == 0xFFFu ? 1u : 0u); break;
+    case 0x17: store_vi(r, it, (status_flags() | ((w >> 10) & 0x800u) | (w & 0x7FFu)) & 0xFFFu); break;
     case 0x18: store_vi(r, it, (mac_flags_now() & 0xFFFFu) == r.vi[is] ? 1u : 0u); break;
     case 0x1A: store_vi(r, it, mac_flags_now() & r.vi[is]); break;
-    case 0x1B: store_vi(r, it, ((mac_flags_now() | r.vi[is]) & 0xFFFFu) == 0xFFFFu ? 1u : 0u); break;
+    case 0x1B: store_vi(r, it, (mac_flags_now() | r.vi[is]) & 0xFFFFu); break;
     case 0x1C: store_vi(r, it, clip_flags() & 0xFFFu); break;
     case 0x20: branch_to(target); break;
     case 0x21: store_vi(r, it, (pc + 16u) / 8u); branch_to(target); break;
@@ -882,6 +852,14 @@ void run_fast(int n, std::uint32_t address) {
         pc = npc;
         npc = (npc + 8u) & u.code_mask;
         ++pipe.t;
+        if (pipe.qt | pipe.pt) {
+            pipe.sync_q(r);
+            pipe.sync_p(r);
+        }
+        if (!(hi & 0x80000000u)) {
+            if (lo == 0x800003BFu) pipe.wait_q(r);
+            else if (lo == 0x800007BFu) pipe.wait_p(r);
+        }
         fast_upper(r, d, out);
         if (hi & 0x80000000u) {
             r.i = lo;
@@ -910,11 +888,13 @@ void run_fast(int n, std::uint32_t address) {
         r.vf[0].w[3] = fp::kOne;
         r.vi[0] = 0;
         if (ending) {
+            pipe.finish(r);
             r.tpc = pc;
             return;
         }
         if (hi & 0x40000000u) ending = true;
     }
+    pipe.finish(r);
     std::fprintf(stderr, "[vu%d] program at 0x%04X did not end\n", n, address);
 }
 
@@ -939,6 +919,14 @@ void run(int n, std::uint32_t address) {
         pc = npc;
         npc = (npc + 8u) & u.code_mask;
         ++pipe.t;
+        if (pipe.qt | pipe.pt) {
+            pipe.sync_q(r);
+            pipe.sync_p(r);
+        }
+        if (!(hi & 0x80000000u)) {
+            if (lo == 0x800003BFu) pipe.wait_q(r);
+            else if (lo == 0x800007BFu) pipe.wait_p(r);
+        }
         UpperOut out = upper(r, hi);
         bool branch = false;
         if (hi & 0x80000000u) {
@@ -959,11 +947,13 @@ void run(int n, std::uint32_t address) {
         r.vf[0].w[3] = fp::kOne;
         r.vi[0] = 0;
         if (ending) {
+            pipe.finish(r);
             r.tpc = pc;
             return;
         }
         if (hi & 0x40000000u) ending = true;
     }
+    pipe.finish(r);
     std::fprintf(stderr, "[vu%d] program at 0x%04X did not end\n", n, address);
 }
 
@@ -989,6 +979,9 @@ void state(ps2::state::Stream &s) {
     s.bytes(g_vu1_code, sizeof g_vu1_code);
     s.bytes(g_vu1_mem, sizeof g_vu1_mem);
     if (s.loading()) {
+        // Older states left the in-flight fields as zeroed padding; nothing is in flight between programs anyway.
+        g_vu1.qwait = g_vu1.pwait = 0;
+        g_cpu.vu0.qwait = g_cpu.vu0.pwait = 0;
         code_changed(0);
         code_changed(1);
     }

@@ -48,7 +48,12 @@ struct Vu0Regs {
     std::uint32_t clip{};
     std::uint32_t cmsar0{};
     std::uint32_t tpc{};
+    // FDIV/EFU results still in flight when a program escapes to another entry; fills
+    // the alignment padding so the struct (and the state format) keeps its size.
+    std::uint32_t qnext{}, pnext{};
+    std::uint16_t qwait{}, pwait{};
 };
+static_assert(sizeof(Vu0Regs) == 608);
 
 struct Cpu {
     Reg128 r[32];

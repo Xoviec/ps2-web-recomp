@@ -3,6 +3,7 @@
 #include "ps2/disc.hpp"
 
 #include "ps2/state.hpp"
+#include "ps2/system.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -122,7 +123,7 @@ void install_cdvd() {
         c.r[2] = 1;
     });
     def("cdvdman", 24, "sceCdReadClock", [](Cpu &c) {
-        const std::time_t t = std::time(nullptr);
+        const std::time_t t = ps2::rtc_time();
         const std::tm *tm = std::gmtime(&t);
         const std::uint32_t p = arg(c, 0);
         write8(p + 0, 0);

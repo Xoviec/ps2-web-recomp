@@ -390,8 +390,10 @@ const keys = new Set();
 const keyMap = { ArrowUp: 4, ArrowRight: 5, ArrowDown: 6, ArrowLeft: 7, KeyZ: 14, KeyX: 13, KeyA: 15, KeyS: 12,
                  KeyQ: 10, KeyW: 11, Digit1: 8, Digit2: 9, Enter: 3, Backspace: 0 };
 const stickKeys = new Set(['KeyI', 'KeyJ', 'KeyK', 'KeyL']);
-window.addEventListener('keydown', (e) => { if (e.code in keyMap || stickKeys.has(e.code)) { keys.add(e.code); e.preventDefault(); } });
-window.addEventListener('keyup', (e) => { keys.delete(e.code); });
+// hand key changes to the pad at once instead of at the next presented frame, which is 50 ms away at 20 fps
+const padNow = () => { if (Module.running) pollInput(); };
+window.addEventListener('keydown', (e) => { if (e.code in keyMap || stickKeys.has(e.code)) { keys.add(e.code); e.preventDefault(); padNow(); } });
+window.addEventListener('keyup', (e) => { keys.delete(e.code); padNow(); });
 const padButtons = [[0, 14], [1, 13], [2, 15], [3, 12], [4, 10], [5, 11], [6, 8], [7, 9], [8, 0], [9, 3], [10, 1], [11, 2],
                     [12, 4], [13, 6], [14, 7], [15, 5]];
 const axis = (v) => Math.max(0, Math.min(255, Math.round((v + 1) * 127.5)));
@@ -411,22 +413,23 @@ function pollInput() {
     lx = axis(touchPad.x);
     ly = axis(touchPad.y);
   }
+  // some browsers list one controller twice (e.g. a DualSense over HID and as a game controller), so merge every pad
   for (const pad of navigator.getGamepads ? navigator.getGamepads() : []) {
-    if (!pad) continue;
-    gamepad = pad;
+    // a second entry without the standard layout would press the wrong buttons
+    if (!pad || (gamepad && pad.mapping !== 'standard')) continue;
+    gamepad ||= pad;
     for (const [index, bit] of padButtons) {
       const b = pad.buttons[index];
       if (!b || !(b.pressed || b.value > 0.05)) continue;
       buttons |= 1 << bit;
       if (!(full & (1 << bit))) pressure[bit] = Math.max(1, Math.round((b.value > 0 ? b.value : 1) * 255));
     }
-    if (pad.axes.length >= 4) {
+    if (pad.axes.length >= 4 && pad === gamepad) {
       if (lx === 128) lx = axis(pad.axes[0]);
       if (ly === 128) ly = axis(pad.axes[1]);
       rx = axis(pad.axes[2]);
       ry = axis(pad.axes[3]);
     }
-    break;
   }
   const state = buttons + lx * 65536 + ly * 16777216 + rx * 4294967296 + ry * 1099511627776;
   if (state !== lastPad) {
