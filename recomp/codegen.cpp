@@ -211,6 +211,7 @@ private:
             if (labelled) {
                 flush();
                 out_ << label(a) << ":\n";
+                if (!relocatable_ && p_.functions.count(a)) line(std::format("PS2_OVERRIDE_HOOK({});", hex(a)));
             }
             if (options_.probes.count(a)) line(std::format("probe(c, {});", pc(a)));
             const Insn i = at(a);
