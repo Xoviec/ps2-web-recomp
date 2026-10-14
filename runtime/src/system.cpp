@@ -404,6 +404,7 @@ int run() {
     }
     gs::stats();
     ipu::stats();
+    override_stats();
     if (const char *path = std::getenv("PS2_DUMP_AUDIO")) iop::spu2::dump_audio(path);
     if (std::getenv("PS2_TRACE_SPU2")) iop::spu2::dump_voices();
     dmac::stats();

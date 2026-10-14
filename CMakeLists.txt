@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(PS2_GENERATED "" CACHE PATH "Folder with the C++ generated for a game")
+set(PS2_OVERRIDES_DIR "" CACHE PATH "Folder of C++ files that replace game functions (runtime/include/ps2/override.hpp)")
 
 if(EMSCRIPTEN)
     add_compile_options(-msimd128 -mtail-call -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -pthread)
@@ -31,6 +32,7 @@ endif()
 add_library(ps2runtime STATIC
     runtime/src/memory.cpp
     runtime/src/dispatch.cpp
+    runtime/src/override.cpp
     runtime/src/system.cpp
     runtime/src/kernel.cpp
     runtime/src/hw.cpp
@@ -90,6 +92,17 @@ if(PS2_GENERATED)
     target_link_libraries(ps2game PUBLIC ps2runtime)
     target_compile_options(ps2game PRIVATE -Wno-unused-label -Wno-unused-variable)
 
+    # Overrides are linked into the runner itself (an object library), so their static
+    # registrations are never dropped the way unreferenced members of an archive are.
+    set(PS2_OVERRIDE_LIBS "")
+    if(PS2_OVERRIDES_DIR)
+        file(GLOB PS2_OVERRIDE_SOURCES CONFIGURE_DEPENDS "${PS2_OVERRIDES_DIR}/*.cpp")
+        add_library(ps2overrides OBJECT ${PS2_OVERRIDE_SOURCES})
+        target_link_libraries(ps2overrides PUBLIC ps2runtime)
+        target_compile_definitions(ps2game PRIVATE PS2_OVERRIDES)
+        set(PS2_OVERRIDE_LIBS ps2overrides)
+    endif()
+
     if(EMSCRIPTEN)
         set(PS2_WEB_ELF "" CACHE FILEPATH "Game executable preloaded as /game/core.elf")
         set(PS2_WEB_BOOT_FILE "" CACHE FILEPATH "Text file holding the argv[0] the game sees, preloaded as /game/boot.txt")
@@ -97,7 +110,7 @@ if(PS2_GENERATED)
         if(PS2_WEB_BOOT_FILE)
             target_link_options(ps2web PRIVATE "SHELL:--preload-file \"${PS2_WEB_BOOT_FILE}@/game/boot.txt\"")
         endif()
-        target_link_libraries(ps2web PRIVATE ps2game ps2runtime)
+        target_link_libraries(ps2web PRIVATE ${PS2_OVERRIDE_LIBS} ps2game ps2runtime)
         target_link_options(ps2web PRIVATE --profiling-funcs -sJSPI -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=268435456 -sPTHREAD_POOL_SIZE=2 -sALLOW_TABLE_GROWTH=1 -lidbfs.js -sSTACK_SIZE=16777216 -sENVIRONMENT=web
             -sEXPORTED_FUNCTIONS=_main,_ps2web_pad,_ps2web_resize,_ps2web_gpu_ms,_ps2web_frames,_ps2web_primitives,_ps2web_audio_ring,_ps2web_audio_queued_ms,_ps2web_idle_ms,_ps2web_vu_interpreted
             -sEXPORTED_RUNTIME_METHODS=callMain,addRunDependency,removeRunDependency,HEAPU8,ENV
@@ -107,7 +120,7 @@ if(PS2_GENERATED)
     endif()
 
     add_executable(ps2run host/main.cpp)
-    target_link_libraries(ps2run PRIVATE ps2game ps2runtime)
+    target_link_libraries(ps2run PRIVATE ${PS2_OVERRIDE_LIBS} ps2game ps2runtime)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         target_sources(ps2run PRIVATE host/profile.cpp)
         target_compile_definitions(ps2run PRIVATE PS2_PROFILE)

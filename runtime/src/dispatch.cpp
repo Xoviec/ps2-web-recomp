@@ -89,6 +89,7 @@ void record_miss(std::uint32_t pc) {
 }
 
 void register_units(const UnitInfo *units, std::uint32_t count) {
+    init_overrides();
     g_units.assign(units, units + count);
     if (g_units.empty()) return;
     std::sort(g_units.begin(), g_units.end(), [](const UnitInfo &a, const UnitInfo &b) { return a.base < b.base; });

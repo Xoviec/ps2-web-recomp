@@ -4,6 +4,7 @@
 #include "fpu.hpp"
 #include "memory.hpp"
 #include "mmi.hpp"
+#include "override.hpp"
 #include "vu.hpp"
 
 #include <cstdint>
@@ -13,6 +14,15 @@ namespace ps2 {
 using UnitFn = void (*)(Cpu &, std::uint32_t entry, std::uint32_t depth);
 
 inline constexpr std::uint32_t kMaxDepth = 192;
+
+// eerecomp puts this at the start of every function of the main program. It costs nothing unless
+// the game is built with PS2_OVERRIDES (CMake PS2_OVERRIDES_DIR); see override.hpp.
+#ifdef PS2_OVERRIDES
+#define PS2_OVERRIDE_HOOK(address) \
+    if (::ps2::override_armed(address)) [[unlikely]] { if (::ps2::enter_override(c, (address), depth)) return; }
+#else
+#define PS2_OVERRIDE_HOOK(address)
+#endif
 
 struct UnitInfo {
     std::uint32_t base;
