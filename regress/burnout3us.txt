@@ -1,0 +1,9 @@
+# Frame-hash regression cases for Burnout 3 USA (scripts/regress.sh, README "Regression tests").
+# States live in games/burnout3us/states/ (ignored with all of games/) or $REGRESS_STATES/burnout3us/.
+# Recorded by one press path (see ~/burnoutfree/docs/usa-test-states.md): menu saved at frame 9000,
+# car select at 10400, race at 19200 (Race Training slides end, race running).
+# name     state               frames  runner args             hashes: <renderer>-<os>-<arch>=md5
+boot       -                   5000 gpu-darwin-arm64=dc6d19534358611cdff6aae9b13f5350
+menu       menu.state          300 gpu-darwin-arm64=4a3ff3225abfbe41d124e8ddc78389ea
+carselect  carselect.state     200 gpu-darwin-arm64=b48a7c1bd80b3faf4fb4aae6d9ef9bc0
+race       race.state          300     --press +0:cross:300 gpu-darwin-arm64=f591fcd15bc61d88b2903d5e184e7978
