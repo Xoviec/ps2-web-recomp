@@ -55,6 +55,7 @@ std::string g_halt_reason;
 std::uint64_t g_frames = 0;
 std::uint64_t g_iop_synced = 0;
 bool g_state_request = false;
+bool g_save_requested = false;
 bool g_resumed = false;
 
 std::uint64_t next_event_time() {
@@ -137,7 +138,7 @@ void vblank() {
     schedule(hw::kEventVblankEnd + 100, now() + hblank_cycles() * 22u, [] { iop::vblank(false); });
     kernel::on_vblank_start();
     if (g_options.max_frames && g_frames >= g_options.max_frames) halt("frame limit reached");
-    if (g_options.save_state_frame && g_frames == g_options.save_state_frame) g_state_request = true;
+    if (g_options.save_state_frame && g_frames == g_options.save_state_frame) g_save_requested = g_state_request = true;
     schedule(hw::kEventVblank, now() + frame_cycles(), vblank);
 }
 
@@ -266,6 +267,20 @@ void machine_state(state::Stream &s) {
 
 }
 
+bool save_state(std::vector<std::uint8_t> &out) {
+    try {
+        state::Writer w;
+        machine_state(w);
+        out = std::move(w.out);
+        return true;
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[state] cannot save: %s\n", e.what());
+        return false;
+    }
+}
+
+void request_safe_point() { g_state_request = true; }
+
 bool save_state(const std::string &path) {
     try {
         state::Writer w;
@@ -369,7 +384,12 @@ int run() {
     while (!g_halted) {
         if (g_state_request) {
             g_state_request = false;
-            save_state(g_options.save_state_path);
+            if (g_save_requested) {
+                g_save_requested = false;
+                save_state(g_options.save_state_path);
+            }
+            if (g_options.on_safe_point) g_options.on_safe_point();
+            continue;
         }
         c.pc &= ~kUnwind;
         run_due_events();

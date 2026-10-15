@@ -281,7 +281,35 @@ void pace() {
     if (g_next_frame > now) usleep(static_cast<useconds_t>((g_next_frame - now) * 1000.0));
 }
 
+// Save and load requests from the page. The page thread only sets these; the emulation thread acts on them at
+// the next frame boundary (on_vblank asks run() for a safe point, on_safe_point does the work there).
+std::atomic<bool> g_save_wanted{false};
+std::atomic<std::uint8_t *> g_load_data{nullptr};
+std::atomic<std::size_t> g_load_size{0};
+
+void on_safe_point() {
+    if (std::uint8_t *data = g_load_data.exchange(nullptr)) {
+        const bool ok = ps2::load_state(data, g_load_size.load());
+        std::free(data);
+        const double frame = static_cast<double>(ps2::frame_count());
+        MAIN_THREAD_ASYNC_EM_ASM({ if (Module.ps2StateLoaded) Module.ps2StateLoaded($0, $1); }, ok ? 1 : 0, frame);
+    }
+    if (g_save_wanted.exchange(false)) {
+        std::vector<std::uint8_t> out;
+        std::uint8_t *copy = nullptr;
+        if (ps2::save_state(out) && (copy = static_cast<std::uint8_t *>(std::malloc(out.size())))) std::memcpy(copy, out.data(), out.size());
+        const double frame = static_cast<double>(ps2::frame_count());
+        // the page copies the bytes out and frees the buffer
+        MAIN_THREAD_ASYNC_EM_ASM({
+            const bytes = $0 ? HEAPU8.slice($0, $0 + $1) : null;
+            if ($0) _free($0);
+            if (Module.ps2StateSaved) Module.ps2StateSaved(bytes, $2);
+        }, copy, copy ? static_cast<double>(out.size()) : 0.0, frame);
+    }
+}
+
 void on_vblank() {
+    if (g_save_wanted.load() || g_load_data.load()) ps2::request_safe_point();
     const double start = emscripten_get_now();
     pace();
     g_emulation_idle.store(g_emulation_idle.load() + emscripten_get_now() - start);
@@ -325,6 +353,18 @@ extern "C" EMSCRIPTEN_KEEPALIVE void ps2web_pad(int buttons, int lx, int ly, int
 extern "C" EMSCRIPTEN_KEEPALIVE void ps2web_pressure(int a, int b, int c, int d) {
     const int packed[4] = {a, b, c, d};
     for (int i = 0; i < 16; ++i) ps2::set_pad_pressure(i, static_cast<std::uint8_t>(static_cast<unsigned>(packed[i / 4]) >> (i % 4 * 8)));
+}
+
+// Saves the machine state at the next frame boundary; Module.ps2StateSaved(bytes or null, frame) receives it.
+extern "C" EMSCRIPTEN_KEEPALIVE void ps2web_request_state() { g_save_wanted.store(true); }
+
+// Loads a state (in a buffer from malloc, which the emulation thread frees; Module.ps2LoadState fills one) at the
+// next frame boundary; Module.ps2StateLoaded(ok, frame) reports the result. Returns 0 while a load is pending.
+extern "C" EMSCRIPTEN_KEEPALIVE int ps2web_request_load(std::uint8_t *data, double size) {
+    if (g_load_data.load()) return 0;
+    g_load_size.store(static_cast<std::size_t>(size));
+    g_load_data.store(data);
+    return 1;
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE int ps2web_rumble() { return ps2::pad_rumble(); }
@@ -371,6 +411,18 @@ int main(int argc, char **argv) {
     g_disc_url = ps2web_disc_url();
     g_state_url = ps2web_state_url();
     ps2::g_options.on_vblank = on_vblank;
+    ps2::g_options.on_safe_point = on_safe_point;
+    // module scope sees the current heap even after it grew, the page's Module.HEAPU8 may not
+    EM_ASM({
+        Module.ps2LoadState = (bytes) => {
+            const at = _malloc(bytes.length);
+            if (!at) return false;
+            HEAPU8.set(bytes, at);
+            if (Module._ps2web_request_load(at, bytes.length)) return true;
+            _free(at);
+            return false;
+        };
+    });
     ps2::g_options.on_vu_program = [](const std::string &name, const std::uint8_t *code, std::size_t size) {
         static bool unsupported = false;
         if (unsupported) return;

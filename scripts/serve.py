@@ -2,6 +2,7 @@
 """Serves a web build and a disc image with HTTP range requests.
 
 usage: serve.py <build dir> <disc image> [port] [--record <dir for unrecorded VU1 programs>]
+                [--states <dir served as /states/, for ?state=states/<name>.state>]
 """
 
 import http.server
@@ -14,6 +15,11 @@ RECORD = None
 if '--record' in sys.argv:
     at = sys.argv.index('--record')
     RECORD = os.path.abspath(sys.argv[at + 1])
+    del sys.argv[at:at + 2]
+STATES = None
+if '--states' in sys.argv:
+    at = sys.argv.index('--states')
+    STATES = os.path.abspath(sys.argv[at + 1])
     del sys.argv[at:at + 2]
 BUILD = os.path.abspath(sys.argv[1])
 DISC = os.path.abspath(sys.argv[2])
@@ -28,6 +34,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             path = '/ps2web.html'
         if path == '/disc.iso':
             return DISC
+        if STATES and path.startswith('/states/'):
+            name = os.path.normpath(path[len('/states/'):])
+            if name.startswith('..') or os.sep in name:
+                return None
+            full = os.path.join(STATES, name)
+            return full if os.path.isfile(full) else None
         name = os.path.normpath(path.lstrip('/'))
         if name.startswith('..') or os.sep in name:
             return None
