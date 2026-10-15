@@ -17,6 +17,9 @@
   button { background: #2a3a55; color: #fff; border: 0; padding: 6px 14px; border-radius: 4px; cursor: pointer; }
   #overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,.6); padding: 16px; }
   #panel { display: flex; flex-direction: column; align-items: center; gap: 14px; max-width: 520px; text-align: center; }
+  #toast { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 10; max-width: calc(100% - 32px); padding: 8px 16px; border-radius: 6px;
+           background: rgba(20,20,24,.92); border: 1px solid #34405a; color: #fff; pointer-events: none; opacity: 0; transition: opacity .2s; }
+  #toast.show { opacity: 1; }
   #help { margin: 0; line-height: 1.5; color: #e8c37a; }
   .controls { display: none; }
   body.touch { overscroll-behavior: none; touch-action: none; -webkit-user-select: none; user-select: none; }
@@ -115,8 +118,12 @@
   <button id="export-card" type="button" title="Download the memory card in slot 1 as a .ps2 file">Export card</button>
   <button id="import-card" type="button" title="Put a .ps2 memory card file in slot 1">Import card</button>
   <input id="import-file" type="file" accept=".ps2" hidden>
+  <button id="save-state" type="button" title="Download a save state of this moment (F5)">Save state</button>
+  <button id="load-state" type="button" title="Continue from a .state file saved earlier">Load state</button>
+  <input id="load-state-file" type="file" accept=".state" hidden>
   <button id="fullscreen" type="button" title="Fullscreen (F or double click)">Fullscreen</button></div>
 <button id="exit-fullscreen" type="button">Exit fullscreen</button>
+<div id="toast" role="status" aria-live="polite"></div>
 <div id="overlay"><div id="panel"><p id="help" hidden></p><button id="start" disabled>Loading…</button></div></div>
 <script>
 const statusEl = document.getElementById('status');
@@ -182,6 +189,72 @@ importInput.addEventListener('change', async () => {
   }
   storeCard(() => location.reload());
 });
+const toastEl = document.getElementById('toast');
+let toastTimer = 0;
+function toast(text) {
+  toastEl.textContent = text;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2500);
+}
+// save states: the emulation thread serializes the machine at the next frame boundary and hands the bytes back
+const GAME_NAMES = { SLUS_21050: 'burnout3us', SLES_52585: 'burnout3' };
+function gameName() {
+  if (params.get('game')) return params.get('game');
+  try {
+    const serial = new TextDecoder().decode(FS.readFile('/game/boot.txt')).match(/([A-Z]{4})_(\d{3})\.(\d{2})/);
+    if (serial) return GAME_NAMES[serial[1] + '_' + serial[2] + serial[3]] || (serial[1] + '_' + serial[2] + serial[3]).toLowerCase();
+  } catch (e) {}
+  return 'ps2';
+}
+function saveState() {
+  if (!Module.running) {
+    toast('Start the game before saving a state');
+    return;
+  }
+  Module._ps2web_request_state();
+}
+document.getElementById('save-state').addEventListener('click', saveState);
+window.addEventListener('keydown', (e) => {
+  if (e.code !== 'F5') return;
+  e.preventDefault();
+  if (!e.repeat) saveState();
+});
+const loadStateInput = document.getElementById('load-state-file');
+document.getElementById('load-state').addEventListener('click', () => {
+  if (!Module.running) {
+    toast('Start the game before loading a state');
+    return;
+  }
+  loadStateInput.click();
+});
+loadStateInput.addEventListener('change', async () => {
+  const file = loadStateInput.files[0];
+  loadStateInput.value = '';
+  if (!file) return;
+  const data = new Uint8Array(await file.arrayBuffer());
+  if (new TextDecoder().decode(data.subarray(0, 8)) !== 'PS2STATE') {
+    toast('That file is not a save state');
+    return;
+  }
+  toast(Module.ps2LoadState && Module.ps2LoadState(data) ? 'Loading ' + file.name + '…' : 'A state is still loading');
+});
+const pad2 = (n) => String(n).padStart(2, '0');
+function stateSaved(bytes, frame) {
+  if (!bytes) {
+    toast('Could not save the state, see the console');
+    return;
+  }
+  const d = new Date();
+  const name = gameName() + '-' + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()) + '-' + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds()) + '-f' + frame + '.state';
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+  link.download = name;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 60000);
+  toast('State saved (frame ' + frame + ')');
+  if (Module.onStateSaved) Module.onStateSaved(name, bytes, frame);
+}
 const statsEl = document.getElementById('stats');
 const canvas = document.getElementById('canvas');
 const params = new URLSearchParams(location.search);
@@ -590,6 +663,8 @@ var Module = {
   }],
   audioQueuedMs: () => Module._ps2web_audio_queued_ms(),
   ps2CardSaved: () => storeCard(),
+  ps2StateSaved: stateSaved,
+  ps2StateLoaded: (ok, frame) => toast(ok ? 'State loaded (frame ' + frame + ')' : 'Could not load the state, see the console'),
   onFrame: () => {
     pollInput();
     ++frames;

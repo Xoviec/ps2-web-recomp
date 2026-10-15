@@ -43,6 +43,9 @@ struct Options {
     std::function<void()> on_memcard_saved;
     std::string save_state_path;
     std::uint64_t save_state_frame = 0;
+    // Called on the emulation thread between instructions after request_safe_point(), where save_state and
+    // load_state may run (the web host saves and loads states there).
+    std::function<void()> on_safe_point;
 };
 
 extern Options g_options;
@@ -75,6 +78,10 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args);
 int run();
 void halt(const std::string &reason);
 bool save_state(const std::string &path);
+bool save_state(std::vector<std::uint8_t> &out);
+// Makes run() stop at the next instruction boundary and call g_options.on_safe_point. Emulation thread only
+// (for example from on_vblank, which then gives a frame boundary).
+void request_safe_point();
 bool load_state(const std::string &path);
 bool load_state(const std::uint8_t *data, std::size_t size);
 bool halted();
